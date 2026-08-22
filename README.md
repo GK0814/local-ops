@@ -6,6 +6,8 @@
 
 > 总控台只服务当前 Mac 和当前用户，不是远程运维、多人协作或公网管理面板。它能以当前用户权限执行你保存的命令，请勿通过反向代理、SSH 隧道或端口映射暴露到不受信任的网络。当前仍为 Preview / Alpha 阶段，接口、配置格式和安装方式可能调整；`总控台.app` 是项目内启动器，不是可单独复制的自包含应用。
 
+**📚 文档**：[使用手册](https://github.com/laogou717/local-ops/wiki/使用手册) · [数据与备份](https://github.com/laogou717/local-ops/wiki/数据与备份) · [故障排查](https://github.com/laogou717/local-ops/wiki/故障排查) · [开发者与发布指南](https://github.com/laogou717/local-ops/wiki/开发者与发布指南) · [Wiki 主页](https://github.com/laogou717/local-ops/wiki)
+
 ## 亮点
 
 - 每 2 秒查看当前用户本地监听服务的 CPU、内存、运行时长与**启动者溯源**（Codex/Claude 等 AI 助手、VS Code/Cursor 等编辑器、终端或总控台）。
@@ -88,7 +90,7 @@ Issue 与 PR 同样可以提交，欢迎讨论与参考，但不承诺审阅或�
 
 ## 更多文档
 
-- Wiki：使用手册 / 数据与备份 / 故障排查 / 开发者与发布指南
+- [Wiki 主页](https://github.com/laogou717/local-ops/wiki)：[使用手册](https://github.com/laogou717/local-ops/wiki/使用手册) / [数据与备份](https://github.com/laogou717/local-ops/wiki/数据与备份) / [故障排查](https://github.com/laogou717/local-ops/wiki/故障排查) / [开发者与发布指南](https://github.com/laogou717/local-ops/wiki/开发者与发布指南)
 - [`CHANGELOG.md`](CHANGELOG.md) — 变更记录
 - [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) — 发布人工验收清单
 
