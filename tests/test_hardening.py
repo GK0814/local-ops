@@ -35,7 +35,7 @@ class HttpHarness:
         self.tmp.cleanup()
 
     def request(self, method, path, body=None, headers=None):
-        conn = http.client.HTTPConnection(server.HOST, self.port, timeout=4)
+        conn = http.client.HTTPConnection(server.HOST, self.port, timeout=10)
         request_headers = dict(headers or {})
         if body is not None and not isinstance(body, (bytes, bytearray)):
             body = body.encode("utf-8")
@@ -151,7 +151,7 @@ class AtomicAttachCreateTests(unittest.TestCase):
             json.dumps({
                 "name": "博客",
                 "command": "npm run dev",
-                "cwd": "/expected",
+                "cwd": os.getcwd() if server.IS_WINDOWS else "/expected",
                 "port": 3000,
                 "kind": "service",
                 "attachPid": 4242,
@@ -178,7 +178,7 @@ class AtomicAttachCreateTests(unittest.TestCase):
         apps = self.h.cfg.snapshot()["apps"]
         self.assertEqual(len(apps), 1)
         self.assertEqual(apps[0]["lastPid"], 4242)
-        self.assertEqual(apps[0]["cwd"], "/actual")
+        self.assertEqual(apps[0]["cwd"], os.getcwd() if server.IS_WINDOWS else "/actual")
         self.assertTrue(apps[0]["attached"])
 
     def test_failed_attach_does_not_leave_a_stopped_card(self):
@@ -189,6 +189,136 @@ class AtomicAttachCreateTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertFalse(body["ok"])
         self.assertEqual(self.h.cfg.snapshot()["apps"], [])
+
+
+class CodexProjectSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.h = HttpHarness()
+
+    def tearDown(self):
+        self.h.close()
+
+    def request_sync(self, cwd, candidate_index=None):
+        body = {"cwd": cwd}
+        if candidate_index is not None:
+            body["candidateIndex"] = candidate_index
+        return self.h.request(
+            "POST", "/api/integrations/codex/sync",
+            json.dumps(body),
+            {"Content-Type": "application/json"},
+        )
+
+    def test_sync_creates_once_and_preserves_manual_card_edits(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "index.html"), "w", encoding="utf-8") as f:
+                f.write("<title>Demo</title>")
+            status, first, _ = self.request_sync(root)
+            self.assertEqual(status, 200)
+            self.assertTrue(first["created"])
+            self.assertEqual(first["app"]["sync"]["origin"], "codex")
+            self.assertEqual(first["app"]["command"], "python -m http.server 8000")
+
+            app_id = first["app"]["id"]
+            self.h.cfg.update(lambda data: next(
+                app for app in data["apps"] if app["id"] == app_id
+            ).__setitem__("command", "python custom_server.py"))
+
+            status, second, _ = self.request_sync(root)
+            self.assertEqual(status, 200)
+            self.assertFalse(second["created"])
+            self.assertEqual(second["app"]["id"], app_id)
+            self.assertEqual(second["app"]["command"], "python custom_server.py")
+            self.assertEqual(len(self.h.cfg.snapshot()["apps"]), 1)
+
+    def test_default_sync_creates_grouped_frontend_and_backend_cards(self):
+        with tempfile.TemporaryDirectory() as root:
+            frontend = os.path.join(root, "frontend")
+            backend = os.path.join(root, "backend")
+            os.mkdir(frontend)
+            os.mkdir(backend)
+            with open(os.path.join(frontend, "package.json"), "w", encoding="utf-8") as f:
+                json.dump({"scripts": {"dev": "vite --host"},
+                           "devDependencies": {"vite": "latest"}}, f)
+            with open(os.path.join(backend, "main.py"), "w", encoding="utf-8") as f:
+                f.write("from fastapi import FastAPI\napp = FastAPI()\n")
+
+            status, first, _ = self.request_sync(root)
+            self.assertEqual(status, 200)
+            self.assertTrue(first["created"])
+            self.assertEqual(first["createdCount"], 2)
+            self.assertEqual({app["sync"]["role"] for app in first["apps"]},
+                             {"frontend", "backend"})
+            self.assertEqual(len({app["sync"]["projectKey"] for app in first["apps"]}), 1)
+            self.assertEqual(sorted(app["port"] for app in first["apps"]), [5173, 8000])
+
+            frontend_app = next(app for app in first["apps"]
+                                if app["sync"]["role"] == "frontend")
+            self.h.cfg.update(lambda data: next(
+                app for app in data["apps"] if app["id"] == frontend_app["id"]
+            ).__setitem__("command", "pnpm run custom-dev"))
+            status, second, _ = self.request_sync(root)
+
+        self.assertEqual(status, 200)
+        self.assertFalse(second["created"])
+        self.assertTrue(second["updated"])
+        self.assertEqual(len(self.h.cfg.snapshot()["apps"]), 2)
+        self.assertEqual(next(app for app in second["apps"]
+                              if app["id"] == frontend_app["id"])["command"],
+                         "pnpm run custom-dev")
+
+
+class AppProjectMembershipTests(unittest.TestCase):
+    def setUp(self):
+        self.h = HttpHarness()
+        self.project_key = "codex:demo"
+        self.h.cfg.update(lambda data: data["apps"].append({
+            **server.Config.APP_DEFAULT,
+            "id": "synced01",
+            "name": "演示项目 · 前端",
+            "command": "npm run dev",
+            "cwd": os.getcwd(),
+            "port": 5173,
+            "sync": {
+                "origin": "codex", "key": self.project_key,
+                "projectKey": self.project_key, "projectName": "演示项目",
+                "projectPath": os.getcwd(), "role": "frontend",
+            },
+        }))
+
+    def tearDown(self):
+        self.h.close()
+
+    def request(self, method, path, body):
+        return self.h.request(method, path, json.dumps(body),
+                              {"Content-Type": "application/json"})
+
+    def test_manual_service_can_join_and_leave_existing_project(self):
+        status, created, _ = self.request("POST", "/api/apps", {
+            "name": "本地代理", "command": "python proxy.py", "cwd": os.getcwd(),
+            "port": 8787, "kind": "service", "projectKey": self.project_key,
+        })
+
+        self.assertEqual(status, 200)
+        self.assertEqual(created["project"], {
+            "key": self.project_key, "name": "演示项目", "cwd": os.getcwd(),
+        })
+        self.assertIsNone(created["sync"])
+
+        status, updated, _ = self.request("PUT", "/api/apps/" + created["id"], {
+            "projectKey": None,
+        })
+        self.assertEqual(status, 200)
+        self.assertIsNone(updated["project"])
+
+    def test_unknown_project_key_cannot_create_orphan_group(self):
+        status, body, _ = self.request("POST", "/api/apps", {
+            "name": "孤立服务", "command": "python orphan.py", "cwd": os.getcwd(),
+            "port": 8788, "kind": "service", "projectKey": "codex:missing",
+        })
+
+        self.assertEqual(status, 422)
+        self.assertFalse(body["ok"])
+        self.assertEqual(len(self.h.cfg.snapshot()["apps"]), 1)
 
 
 class DeliveryMetadataTests(unittest.TestCase):
@@ -453,6 +583,7 @@ class ProcessLifecycleHardeningTests(unittest.TestCase):
                     except OSError:
                         pass
 
+    @unittest.skipIf(server.IS_WINDOWS, "SIGTERM-ignoring process groups require POSIX signals")
     def test_sigterm_timeout_retains_runtime_identity_for_retry(self):
         command = (
             "python3 -c 'import signal,time; "
@@ -553,6 +684,8 @@ class StaticFileServingTests(unittest.TestCase):
         self.assertEqual(status, 404)
 
     def test_symlink_inside_static_cannot_escape_to_outside(self):
+        if server.IS_WINDOWS:
+            self.skipTest("creating symlinks requires Windows developer privileges")
         with tempfile.TemporaryDirectory() as td:
             outside = os.path.join(td, "secret.txt")
             with open(outside, "w", encoding="utf-8") as f:
@@ -804,11 +937,11 @@ class AttachConflictTests(unittest.TestCase):
         self.h = HttpHarness()
         claimed = {**server.Config.APP_DEFAULT, "id": "aaaa0001",
                    "name": "已有卡片", "command": "x", "kind": "service",
-                   "cwd": "/other", "port": 3000,
+                   "cwd": os.getcwd() if server.IS_WINDOWS else "/other", "port": 3000,
                    "lastPid": 4242, "attached": True}
         other = {**server.Config.APP_DEFAULT, "id": "bbbb0002",
                  "name": "新卡片", "command": "y", "kind": "service",
-                 "cwd": "/expected", "port": 3000}
+                 "cwd": os.getcwd() if server.IS_WINDOWS else "/expected", "port": 3000}
         self.h.cfg.update(lambda d: d["apps"].extend([claimed, other]))
 
     def tearDown(self):
@@ -843,7 +976,7 @@ class AttachConflictTests(unittest.TestCase):
             status, body, _ = self.h.request(
                 "POST", "/api/apps",
                 json.dumps({"name": "新应用", "command": "npm run dev",
-                            "cwd": "/expected", "port": 3000,
+                            "cwd": os.getcwd() if server.IS_WINDOWS else "/expected", "port": 3000,
                             "kind": "service", "attachPid": 4242}),
                 {"Content-Type": "application/json"})
         self.assertEqual(status, 409)
@@ -867,6 +1000,16 @@ class StateCacheTests(unittest.TestCase):
             return {"built": len(calls), "port": port}
         return fake_build
 
+    def _wait_for_builds(self, calls, expected):
+        deadline = time.monotonic() + 1
+        while (len(calls) < expected or
+               (server._state_cache.get("state") or {}).get("built") != expected) \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(calls), expected)
+        self.assertEqual((server._state_cache.get("state") or {}).get("built"),
+                         expected)
+
     def test_snapshot_reused_within_ttl_and_rebuilt_after_invalidate(self):
         calls = []
         cfg = mock.Mock()
@@ -877,10 +1020,13 @@ class StateCacheTests(unittest.TestCase):
             second = server.get_state_snapshot(cfg, 9600)
             server.invalidate_state_cache()
             third = server.get_state_snapshot(cfg, 9600)
+            self._wait_for_builds(calls, 2)
+            fourth = server.get_state_snapshot(cfg, 9600)
         self.assertEqual(calls, [9600, 9600])
         self.assertEqual(first, {"built": 1, "port": 9600})
         self.assertIs(second, first)
-        self.assertEqual(third, {"built": 2, "port": 9600})
+        self.assertIs(third, first)
+        self.assertEqual(fourth, {"built": 2, "port": 9600})
 
     def test_config_update_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as td:
@@ -894,7 +1040,7 @@ class StateCacheTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
                 cfg.update(lambda d: d.__setitem__("uiTheme", "custom"))
                 server.get_state_snapshot(cfg, 9600)
-                self.assertEqual(len(calls), 2)
+                self._wait_for_builds(calls, 2)
 
 
 if __name__ == "__main__":

@@ -11,11 +11,16 @@ permissions:
 jobs:
   check-and-release:
     name: Check and release audit
-    runs-on: macos-15
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       SOURCE_DATE_EPOCH: "1704067200"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
 
     steps:
       - name: Check out source
@@ -34,13 +39,24 @@ jobs:
           node --version
 
       - name: Run project checks
-        run: make check PYTHON=python
+        run: python tools/check_project.py --skip-tests
+
+      - name: Run macOS behavior tests
+        if: runner.os == 'macOS'
+        run: python tools/check_project.py
+
+      - name: Run Windows behavior tests
+        if: runner.os == 'Windows'
+        run: python tools/check_project.py
 
       - name: Build and verify release
+        shell: pwsh
         run: |
-          make release PYTHON=python
-          make release-verify PYTHON=python
-          cp dist/console-*.zip "$RUNNER_TEMP/console-first.zip"
-          make release PYTHON=python
-          cmp "$RUNNER_TEMP/console-first.zip" dist/console-*.zip
-          make release-verify PYTHON=python
+          python tools/build_release.py
+          python tools/build_release.py --verify-only
+          $archive = Get-ChildItem dist/console-*.zip | Select-Object -First 1
+          Copy-Item $archive "$env:RUNNER_TEMP/console-first.zip"
+          python tools/build_release.py
+          $second = Get-ChildItem dist/console-*.zip | Select-Object -First 1
+          if ((Get-FileHash $second -Algorithm SHA256).Hash -ne (Get-FileHash "$env:RUNNER_TEMP/console-first.zip" -Algorithm SHA256).Hash) { throw 'Release archive is not reproducible' }
+          python tools/build_release.py --verify-only

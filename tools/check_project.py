@@ -112,7 +112,10 @@ def check_required_files() -> str:
         "Makefile",
         "server.py",
         "start.command",
+        "start.ps1",
+        "start.bat",
         "tests/test_server.py",
+        "tools/local_ops_mcp.py",
         "docs/screenshots/ops-launchpad.jpg",
         "docs/screenshots/ops-services.jpg",
         "static/index.html",
@@ -392,6 +395,22 @@ def check_javascript_bindings() -> str:
 
 
 def check_shell_and_plist() -> str:
+    if os.name == "nt":
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        require(powershell is not None, "未找到 PowerShell")
+        script = ROOT / "start.ps1"
+        command_output([
+            powershell, "-NoProfile", "-NonInteractive", "-Command",
+            "[void][scriptblock]::Create((Get-Content -Raw -LiteralPath '%s'))" % script,
+        ])
+        require((ROOT / "start.bat").is_file(), "缺少 start.bat")
+        shortcut_script = ROOT / "tools" / "install_desktop_shortcut.ps1"
+        require(shortcut_script.is_file(), "缺少桌面快捷方式安装脚本")
+        command_output([
+            powershell, "-NoProfile", "-NonInteractive", "-Command",
+            "[void][scriptblock]::Create((Get-Content -Raw -LiteralPath '%s'))" % shortcut_script,
+        ])
+        return "Windows PowerShell 启动脚本"
     shell_files = (
         ROOT / "start.command",
         ROOT / "总控台.app" / "Contents" / "MacOS" / "launcher",
@@ -554,10 +573,12 @@ def check_javascript_tests() -> str:
     files = sorted(str(path) for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
     require(bool(files), "tests/js/ 下没有 .test.mjs 测试文件")
     output = command_output([node, "--test", *files])
-    match = re.search(r"# (pass)\s+(\d+)", output)
+    # Avoid relying on Node's Unicode summary marker: Windows console decoding
+    # can replace it before this checker receives the output.
+    match = re.search(r"\bpass\s+(\d+)", output)
     require(match is not None, "无法确认 node --test 结果")
-    passed = int(match.group(2))
-    require("# fail" not in output or re.search(r"# fail\s+0$", output, re.M),
+    passed = int(match.group(1))
+    require(not re.search(r"\bfail\s+(?!0\b)\d+", output),
             "JavaScript 测试存在失败项")
     return f"{passed} 个测试"
 

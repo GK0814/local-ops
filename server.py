@@ -8,9 +8,9 @@ API 契约与实现要点见 AGENTS.md。
 """
 
 import glob
-import fcntl
 import functools
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -31,12 +31,24 @@ import webbrowser
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_PATH = os.path.join(BASE_DIR, "VERSION")
 LEGACY_DATA_DIR = os.path.join(BASE_DIR, "data")
-DEFAULT_DATA_DIR = os.path.expanduser(
-    "~/Library/Application Support/总控台")
-DEFAULT_LOGS_DIR = os.path.expanduser("~/Library/Logs/总控台")
+if IS_WINDOWS:
+    _LOCAL_APP_DATA = os.environ.get("LOCALAPPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Local")
+    DEFAULT_DATA_DIR = os.path.join(_LOCAL_APP_DATA, "总控台")
+    DEFAULT_LOGS_DIR = os.path.join(DEFAULT_DATA_DIR, "logs")
+else:
+    DEFAULT_DATA_DIR = os.path.expanduser(
+        "~/Library/Application Support/总控台")
+    DEFAULT_LOGS_DIR = os.path.expanduser("~/Library/Logs/总控台")
 
 
 def resolve_runtime_dir(name, default):
@@ -100,18 +112,27 @@ MAX_LOG_BYTES = 10 * 1024 * 1024
 LOG_BACKUPS = 3
 LOG_MAINTENANCE_SEC = 30
 STARTUP_PROBE_SEC = 0.25
+FRONTEND_OPEN_WAIT_SEC = 30.0
+FRONTEND_OPEN_POLL_SEC = 0.25
+RESTART_SIGNATURE_CAPTURE_SEC = 30.0
 APP_STOP_TIMEOUT_SEC = 5.0
 RUN_TOKEN_ENV = "CONSOLE_RUN_TOKEN"
 RUN_TOKEN_ARG_PREFIX = "console-run:"
 TASK_CANCELED_EXIT_CODE = 130
 
 SELF_PID = os.getpid()
-SELF_UID = os.getuid()
+SELF_UID = (os.environ.get("USERNAME") or os.environ.get("USER") or "").casefold() \
+    if IS_WINDOWS else os.getuid()
 ICON_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".ico")
 LOG = logging.getLogger("console")
 LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
+WINDOWS_CPU_LOCK = threading.RLock()
+WINDOWS_CPU_SAMPLES = {}
+WINDOWS_CPU_SAMPLE_MAX_AGE_SEC = 300
+INSTANCE_LOCK_GUARD = threading.RLock()
+ACTIVE_INSTANCE_LOCKS = set()
 
 
 def classify_task_exit(code):
@@ -183,7 +204,8 @@ def _ensure_private_dir(path):
     if os.path.islink(path) or not os.path.isdir(path):
         raise OSError("私有运行路径不是安全目录: %s" % path)
     try:
-        os.chmod(path, 0o700)
+        if not IS_WINDOWS:
+            os.chmod(path, 0o700)
     except OSError:
         LOG.warning("无法收紧目录权限: %s", path)
 
@@ -330,7 +352,8 @@ def write_private_bytes(path, payload):
         f.write(payload)
         f.flush()
         os.fsync(f.fileno())
-    os.chmod(path, 0o600)
+    if not IS_WINDOWS:
+        os.chmod(path, 0o600)
 
 
 # ---------------------------------------------------------------- 配置
@@ -389,7 +412,10 @@ class Config:
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
-                   "attached": False, "lastExit": None, "createdAt": 0}
+                   "attached": False, "attachSignature": None,
+                   "restartSignature": None,
+                   "autoOpen": False, "sync": None, "project": None, "lastExit": None,
+                   "createdAt": 0}
 
     def __init__(self, path):
         self._lock = threading.RLock()
@@ -542,28 +568,49 @@ def acquire_instance_lock(path=INSTANCE_LOCK_PATH):
     :9600/:9601 would still update the same config.  flock ties exclusivity to
     this data directory and is released automatically if the process crashes.
     """
+    path = os.path.abspath(path)
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, mode=0o700, exist_ok=True)
+    with INSTANCE_LOCK_GUARD:
+        if path in ACTIVE_INSTANCE_LOCKS:
+            return None
+        ACTIVE_INSTANCE_LOCKS.add(path)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     lock_file = os.fdopen(fd, "r+", encoding="ascii")
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if IS_WINDOWS:
+            lock_file.seek(0)
+            lock_file.write(" ")
+            lock_file.flush()
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as e:
         lock_file.close()
-        if e.errno in (errno.EACCES, errno.EAGAIN):
+        with INSTANCE_LOCK_GUARD:
+            ACTIVE_INSTANCE_LOCKS.discard(path)
+        if e.errno in (errno.EACCES, errno.EAGAIN, 13):
             return None
         raise
     try:
-        os.fchmod(lock_file.fileno(), 0o600)
+        if not IS_WINDOWS:
+            os.fchmod(lock_file.fileno(), 0o600)
         lock_file.seek(0)
         lock_file.truncate()
         lock_file.write("%d\n" % SELF_PID)
         lock_file.flush()
         os.fsync(lock_file.fileno())
     except OSError:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        if IS_WINDOWS:
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         lock_file.close()
+        with INSTANCE_LOCK_GUARD:
+            ACTIVE_INSTANCE_LOCKS.discard(path)
         raise
+    lock_file._console_lock_path = path
     return lock_file
 
 
@@ -571,19 +618,50 @@ def release_instance_lock(lock_file):
     if lock_file is None:
         return
     try:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        if IS_WINDOWS:
+            lock_file.seek(0)
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                # The lock may have already been released while closing a
+                # failed second handle in older C runtimes. The in-process
+                # registry remains authoritative for this process.
+                pass
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     finally:
         lock_file.close()
+        with INSTANCE_LOCK_GUARD:
+            ACTIVE_INSTANCE_LOCKS.discard(getattr(lock_file, "_console_lock_path", ""))
 
 
 # ---------------------------------------------------------------- 子进程与解析
 
 def run_cmd(args, timeout=SUBPROCESS_TIMEOUT):
-    """运行命令并返回 stdout；任何异常/超时都返回空串，绝不上抛。"""
+    """运行命令并返回 stdout；超时不会等待 Windows 子树关闭管道。"""
+    proc = None
     try:
-        r = subprocess.run(args, capture_output=True, text=True,
-                           errors="replace", timeout=timeout)
-        return r.stdout or ""
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="replace")
+        stdout, _ = proc.communicate(timeout=timeout)
+        return stdout or ""
+    except subprocess.TimeoutExpired:
+        # subprocess.run() 在 Windows 超时后会无期限等待后代关闭继承的
+        # 输出管道。WMI 偶发卡住时这会占住 /api/state 的缓存锁，进而令每个
+        # 浏览器轮询都超时。结束启动器并立即关闭本端管道，保证调用方返回。
+        LOG.warning("命令执行超时: %r", args)
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except (AttributeError, OSError):
+                    pass
+        return ""
     except Exception:
         LOG.exception("命令执行失败: %r", args)
         return ""
@@ -622,8 +700,21 @@ def scan_listeners():
     字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
     供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
     """
-    out = run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"])
     found = {}
+    if IS_WINDOWS:
+        for line in run_cmd(["netstat.exe", "-ano", "-p", "tcp"]).splitlines():
+            fields = line.split()
+            if len(fields) < 5 or fields[0].upper() != "TCP" \
+                    or fields[-2].upper() != "LISTENING":
+                continue
+            try:
+                bind_host, port_text = fields[1].rsplit(":", 1)
+                pid, port = int(fields[-1]), int(port_text)
+            except (TypeError, ValueError):
+                continue
+            found.setdefault((pid, port), set()).add(bind_host.strip("[]"))
+        return found
+    out = run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"])
     for line in out.splitlines():
         if not line or line.startswith("COMMAND"):
             continue
@@ -687,6 +778,26 @@ def ps_snapshot(pids=None, with_uid=True):
     注意：不能用 `comm=` 抑制表头——macOS ps 会把空表头列压到 16 字节截断
     内容；保留表头后解析时跳过表头行即可（首列非数字的行）。
     """
+    if IS_WINDOWS:
+        requested = sorted({int(pid) for pid in pids}) if pids is not None else None
+        pid_setup = ("$ids=@(%s); " % ",".join(map(str, requested))
+                     if requested else "$ids=$null; ")
+        script = ("$ErrorActionPreference='SilentlyContinue'; " + pid_setup +
+                  "$session=(Get-Process -Id $PID).SessionId; $cims=@{}; "
+                  "$totalMemory=(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory; "
+                  "if($ids){foreach($id in $ids){$cim=Get-CimInstance Win32_Process -Filter ('ProcessId='+[int]$id); if($cim){$cims[[int]$cim.ProcessId]=$cim}}}else{Get-CimInstance Win32_Process | ForEach-Object { $cims[[int]$_.ProcessId]=$_ }}; "
+                  "$all=Get-Process | Where-Object { $_.SessionId -eq $session }; " +
+                  "$all | Where-Object { !$ids -or $_.Id -in $ids } | "
+                  "ForEach-Object { $proc=$_; $cim=$cims[[int]$proc.Id]; [pscustomobject]@{ "
+                  "pid=$proc.Id; uid=$env:USERNAME; comm=if($proc.Path){$proc.Path}else{$proc.ProcessName}; "
+                  "args=if($cim){$cim.CommandLine}else{''}; "
+                  "cpuSeconds=if($null -ne $proc.CPU){[double]$proc.CPU}else{0}; "
+                  "mem=if($totalMemory -gt 0){[math]::Round($proc.WorkingSet64/$totalMemory*100,2)}else{0}; "
+                  "etime=if($proc.StartTime){[math]::Floor(((Get-Date)-$proc.StartTime).TotalSeconds)}else{0}; "
+                  "ppid=if($cim){$cim.ParentProcessId}else{0} } } | ConvertTo-Json -Compress")
+        return windows_snapshot_from_output(run_cmd([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]))
+
     base = ["ps"]
     if pids is None:
         base.append("-ax")
@@ -738,10 +849,102 @@ def ps_snapshot(pids=None, with_uid=True):
     return snap
 
 
+def windows_snapshot_from_output(output):
+    """解析 Windows 进程采样脚本的 JSON 并更新 CPU 采样缓存。"""
+    try:
+        records = json.loads(output or "[]")
+    except json.JSONDecodeError:
+        records = []
+    if isinstance(records, dict):
+        records = [records]
+    sampled_at = time.monotonic()
+    cpu_count = max(1, os.cpu_count() or 1)
+    snapshot = {}
+    raw_cpu = {}
+    for record in records:
+        if not isinstance(record, dict) or not record.get("pid"):
+            continue
+        try:
+            pid = int(record["pid"])
+        except (TypeError, ValueError):
+            continue
+        raw_cpu[pid] = _to_float(record.get("cpuSeconds"))
+        snapshot[pid] = {
+            "uid": str(record.get("uid") or "").casefold(),
+            "comm": str(record.get("comm") or ""),
+            "args": str(record.get("args") or ""),
+            "cpu": 0.0,
+            "mem": _to_float(record.get("mem")),
+            "etime": int(_to_float(record.get("etime"))),
+            "ppid": int(_to_float(record.get("ppid"))),
+        }
+    # Get-Process exposes accumulated CPU seconds rather than an instant
+    # percentage. Derive the current load from two snapshots and normalize
+    # it to the machine's logical CPU capacity, matching the UI's 0-100%
+    # aggregate semantics.
+    with WINDOWS_CPU_LOCK:
+        for pid, cpu_seconds in raw_cpu.items():
+            previous = WINDOWS_CPU_SAMPLES.get(pid)
+            if previous:
+                previous_cpu, previous_at = previous
+                elapsed = sampled_at - previous_at
+                if elapsed > 0:
+                    snapshot[pid]["cpu"] = round(max(0.0, min(
+                        100.0, (cpu_seconds - previous_cpu) / elapsed
+                        / cpu_count * 100.0)), 2)
+            WINDOWS_CPU_SAMPLES[pid] = (cpu_seconds, sampled_at)
+        stale_before = sampled_at - WINDOWS_CPU_SAMPLE_MAX_AGE_SEC
+        for pid, (_, captured_at) in list(WINDOWS_CPU_SAMPLES.items()):
+            if captured_at < stale_before:
+                WINDOWS_CPU_SAMPLES.pop(pid, None)
+    return snapshot
+
+
+def windows_process_tree_snapshot(root_pids, extra_pids=(), max_depth=12):
+    """只采样受管进程树与监听者，避免轮询全量 WMI 进程表。"""
+    if not IS_WINDOWS:
+        return {}
+    roots = sorted({int(pid) for pid in root_pids if isinstance(pid, int) and pid > 0})
+    extras = sorted({int(pid) for pid in extra_pids if isinstance(pid, int) and pid > 0})
+    wanted = sorted(set(roots) | set(extras))
+    if not wanted:
+        return {}
+    root_text = ",".join(map(str, roots))
+    wanted_text = ",".join(map(str, wanted))
+    script = ("$ErrorActionPreference='SilentlyContinue'; "
+              "$session=(Get-Process -Id $PID).SessionId; "
+              "$cims=@{}; $seen=@{}; $roots=@(%s); $wanted=@(%s); " %
+              (root_text, wanted_text) +
+              "$initialFilter=(($wanted | ForEach-Object {'ProcessId='+[int]$_}) -join ' OR '); "
+              "Get-CimInstance Win32_Process -Filter $initialFilter | ForEach-Object {$cims[[int]$_.ProcessId]=$_}; "
+              "$frontier=$roots; " +
+              "for($depth=0;$depth -le %d -and $frontier.Count -gt 0;$depth++){"
+              "$active=@($frontier | Where-Object {!$seen.ContainsKey([int]$_)}); if(!$active.Count){break}; "
+              "$active | ForEach-Object {$seen[[int]$_]=$true}; "
+              "$childFilter=(($active | ForEach-Object {'ParentProcessId='+[int]$_}) -join ' OR '); "
+              "$children=@(Get-CimInstance Win32_Process -Filter $childFilter); "
+              "$children | ForEach-Object {$cims[[int]$_.ProcessId]=$_}; $frontier=@($children | ForEach-Object {[int]$_.ProcessId})}; " % int(max_depth) +
+              "$totalMemory=(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory; "
+              "$all=Get-Process | Where-Object {$_.SessionId -eq $session -and $cims.ContainsKey([int]$_.Id)}; "
+              "$all | ForEach-Object {$proc=$_; $cim=$cims[[int]$proc.Id]; [pscustomobject]@{"
+              "pid=$proc.Id; uid=$env:USERNAME; comm=if($proc.Path){$proc.Path}else{$proc.ProcessName}; "
+              "args=if($cim){$cim.CommandLine}else{''}; cpuSeconds=if($null -ne $proc.CPU){[double]$proc.CPU}else{0}; "
+              "mem=if($totalMemory -gt 0){[math]::Round($proc.WorkingSet64/$totalMemory*100,2)}else{0}; "
+              "etime=if($proc.StartTime){[math]::Floor(((Get-Date)-$proc.StartTime).TotalSeconds)}else{0}; "
+              "ppid=if($cim){$cim.ParentProcessId}else{0}}} | ConvertTo-Json -Compress")
+    return windows_snapshot_from_output(run_cmd([
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]))
+
+
 def lsof_cwds(pids):
     """lsof -a -p <pids> -d cwd -Fn → {pid: cwd}。"""
     pids = [int(p) for p in pids]
     if not pids:
+        return {}
+    if IS_WINDOWS:
+        # Windows does not expose another process's working directory through a
+        # supported standard API. Controlled applications retain their configured
+        # cwd; external-process attachment therefore remains deliberately strict.
         return {}
     out = run_cmd(["lsof", "-a", "-p", ",".join(str(p) for p in pids),
                    "-d", "cwd", "-Fn"])
@@ -759,6 +962,8 @@ def lsof_cwds(pids):
 
 
 def pid_alive(pid):
+    if IS_WINDOWS:
+        return int(pid) in ps_snapshot({pid}, with_uid=True)
     try:
         os.kill(int(pid), 0)
         return True
@@ -771,6 +976,17 @@ def pid_alive(pid):
 # ---------------------------------------------------------------- 状态构建
 
 SYSTEM_PATH_PREFIXES = ("/usr/libexec/", "/usr/sbin/", "/sbin/", "/System/", "/usr/lib/")
+WINDOWS_SYSTEM_PATH_PREFIXES = (
+    r"c:\\windows\\", r"c:\\program files\\windowsapps\\",
+)
+WINDOWS_BACKGROUND_PROCESS_NAMES = {
+    "applicationframehost", "audiodg", "baidupinyin", "chrome", "code",
+    "cursor", "explorer", "firefox", "lghub", "lghub_agent",
+    "lghub_updater", "lztray", "msedge", "onedrive", "onedrive.sync.service",
+    "qq", "searchhost", "shellexperiencehost", "startmenuexperiencehost",
+    "taskhostw", "textinputhost", "weixin", "wechat", "yundetectservice",
+    "apifoxappagent", "figma_agent", "vecagent",
+}
 
 # 开发服务关键词：命中 name/args 时优先归为 "mine"（覆盖 .app 规则，
 # 例如 ollama 守护进程在 Ollama.app 内、Docker 在 Docker.app 内）
@@ -782,11 +998,20 @@ DEV_KEYWORDS = (
 )
 
 
-def classify_group(key, name, comm, args, cwd, promoted):
+def classify_group(key, name, comm, args, cwd, promoted, managed=False):
     if key in promoted:
+        return "mine"
+    if managed:
         return "mine"
     text = name.lower()
     if any(k in text for k in DEV_KEYWORDS):
+        return "mine"
+    if IS_WINDOWS:
+        executable = os.path.splitext(text)[0]
+        normalized_comm = (comm or "").replace("/", "\\").casefold()
+        if (executable in WINDOWS_BACKGROUND_PROCESS_NAMES
+                or normalized_comm.startswith(WINDOWS_SYSTEM_PATH_PREFIXES)):
+            return "background"
         return "mine"
     if ".app/Contents/" in comm or ".app/Contents/" in args:
         return "background"
@@ -804,7 +1029,7 @@ def project_name(cwd):
     """从工作目录推断项目名（最后一段目录名），无有效 cwd 时返回 None。"""
     if not cwd:
         return None
-    cwd = cwd.rstrip("/")
+    cwd = cwd.rstrip("/\\")
     if not cwd or cwd == "/" or cwd == HOME_DIR:
         return None
     return os.path.basename(cwd) or None
@@ -874,8 +1099,13 @@ _ORIGIN_BUNDLE_RE = re.compile(r"/([^/]+)\.app/Contents/MacOS/", re.I)
 _ORIGIN_MULTIPLEXERS = {"tmux": "tmux", "screen": "screen"}
 
 
-def origin_snapshot():
+def origin_snapshot(process_snapshot=None):
     """ps -axo pid=,ppid=,args → {pid: (ppid, args)}，供来源溯源。"""
+    if IS_WINDOWS and process_snapshot is not None:
+        return {
+            pid: (info.get("ppid", 0), info.get("args") or "")
+            for pid, info in process_snapshot.items()
+        }
     table = {}
     for line in run_cmd(["ps", "-axo", "pid=,ppid=,args"]).splitlines():
         toks = line.split(None, 2)
@@ -932,15 +1162,21 @@ def attribute_origin(pid, table):
     return candidate
 
 
-def build_services(cfg, groups=None):
+def build_services(cfg, groups=None, listeners=None, process_snapshot=None):
     """返回 (services, listeners)。只含当前用户进程，排除控制台自身。"""
-    listeners = scan_listeners()
-    snap = ps_snapshot({pid for pid, _ in listeners}, with_uid=True)
+    if listeners is None:
+        listeners = scan_listeners()
+    listener_pids = {pid for pid, _ in listeners}
+    if process_snapshot is None:
+        snap = ps_snapshot(listener_pids, with_uid=True)
+    else:
+        snap = {pid: process_snapshot[pid] for pid in listener_pids
+                if pid in process_snapshot}
     mine_pids = [pid for pid, _ in listeners
                  if pid != SELF_PID and pid in snap
                  and snap[pid].get("uid") == SELF_UID]
     cwds = lsof_cwds(mine_pids)
-    origin_table = origin_snapshot()
+    origin_table = origin_snapshot(process_snapshot)
 
     hidden = set(cfg.get("hidden") or [])
     pinned = set(cfg.get("pinned") or [])
@@ -948,7 +1184,8 @@ def build_services(cfg, groups=None):
     # “配置了相同端口”不代表“拥有当前监听进程”。只有 run token / 进程组
     # 校验通过（或严格命中旧版身份）的进程才关联启动台卡片。
     app_by_pid = listener_app_owners(
-        cfg.get("apps") or [], listeners, snap, cwds, groups)
+        cfg.get("apps") or [], listeners, snap, cwds, groups,
+        process_snapshot)
 
     services = []
     for pid, port in sorted(listeners, key=lambda x: (x[1], x[0])):
@@ -972,7 +1209,8 @@ def build_services(cfg, groups=None):
             "openHost": listener_open_host(listeners, port, {pid}),
             "cwd": cwd, "project": project_name(cwd), "cmd": args,
             "cpu": info["cpu"], "mem": info["mem"], "uptimeSec": info["etime"],
-            "group": classify_group(key, name, comm, args, cwd, promoted),
+            "group": classify_group(key, name, comm, args, cwd, promoted,
+                                    managed=bool(app)),
             "pinned": key in pinned, "hidden": key in hidden,
             "promoted": key in promoted,
             "appId": app["id"] if app else None,
@@ -983,7 +1221,7 @@ def build_services(cfg, groups=None):
     return services, listeners
 
 
-def build_watched(keywords):
+def build_watched(keywords, process_snapshot=None):
     """关注进程：每个 PID 只返回一次，并合并它命中的全部关键字。"""
     normalized = []
     seen_keywords = set()
@@ -998,7 +1236,8 @@ def build_watched(keywords):
         normalized.append((keyword, lowered))
     if not normalized:
         return []
-    snap = ps_snapshot(None, with_uid=True)
+    snap = (process_snapshot if process_snapshot is not None
+            else ps_snapshot(None, with_uid=True))
     result = []
     for pid, info in sorted(snap.items()):
         if pid == SELF_PID or info.get("uid") != SELF_UID:
@@ -1020,10 +1259,29 @@ def build_watched(keywords):
     return result
 
 
-def pgid_members_map():
+def pgid_members_map(process_snapshot=None):
     """ps -axo pid=,pgid= → {pgid: [pid, ...]}。
     进程退出后其子孙仍保留原 pgid（被 launchd 收养也不变），
     因此按 pgid 能找到「脚本把服务放后台后自己退出」的存活成员。"""
+    if IS_WINDOWS:
+        snap = (process_snapshot if process_snapshot is not None
+                else ps_snapshot(None, with_uid=True))
+        children = {}
+        for pid, info in snap.items():
+            children.setdefault(info.get("ppid"), []).append(pid)
+        groups = {}
+        for root in snap:
+            pending, members, seen = [root], [], set()
+            while pending:
+                pid = pending.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                members.append(pid)
+                pending.extend(child for child in children.get(pid, [])
+                               if child not in seen)
+            groups[root] = members
+        return groups
     groups = {}
     for line in run_cmd(["ps", "-axo", "pid=,pgid="]).splitlines():
         parts = line.split()
@@ -1045,7 +1303,7 @@ def _managed_candidates(app, groups):
     return set(groups.get(pgid, []))
 
 
-def managed_process_index(apps, groups=None):
+def managed_process_index(apps, groups=None, process_snapshot=None):
     """批量校验应用的受控进程，返回 (appId -> [pid], ps, groups)。
 
     必须同时满足：属于记录的进程组、属于当前用户、argv 中带本次启动的
@@ -1056,14 +1314,19 @@ def managed_process_index(apps, groups=None):
             app.get("runToken")
             and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
             for app in apps)
-        groups = pgid_members_map() if needs_groups else {}
+        groups = (pgid_members_map(process_snapshot)
+                  if needs_groups else {})
     candidates = {}
     all_pids = set()
     for app in apps:
         pids = _managed_candidates(app, groups)
         candidates[app.get("id")] = pids
         all_pids.update(pids)
-    snap = ps_snapshot(all_pids, with_uid=True) if all_pids else {}
+    if process_snapshot is not None:
+        snap = {pid: process_snapshot[pid] for pid in all_pids
+                if pid in process_snapshot}
+    else:
+        snap = ps_snapshot(all_pids, with_uid=True) if all_pids else {}
     result = {}
     for app in apps:
         token = app.get("runToken")
@@ -1095,8 +1358,7 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     recorded_pid = app.get("lastPid")
     port = app.get("port")
     expected_cwd = app.get("cwd")
-    if (not isinstance(port, int) or port <= 0
-            or not isinstance(expected_cwd, str) or not expected_cwd):
+    if not isinstance(port, int) or port <= 0:
         return None
     if listeners is None:
         listeners = scan_listeners()
@@ -1110,6 +1372,19 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
         return None
     if snap is None:
         snap = ps_snapshot(port_pids, with_uid=True)
+    if IS_WINDOWS and app.get("attached"):
+        expected_signature = app.get("attachSignature")
+        if (not isinstance(recorded_pid, int) or recorded_pid <= 0
+                or not isinstance(expected_signature, str) or not expected_signature):
+            return None
+        info = snap.get(recorded_pid, {})
+        if (recorded_pid in port_pids
+                and info.get("uid") == SELF_UID
+                and process_signature(info) == expected_signature):
+            return recorded_pid
+        return None
+    if not isinstance(expected_cwd, str) or not expected_cwd:
+        return None
     if cwds is None:
         cwds = lsof_cwds(port_pids)
     matches = []
@@ -1131,20 +1406,90 @@ def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
     return matches[0] if app.get("attached") and len(matches) == 1 else None
 
 
-def listener_app_owners(apps, listeners, snap, cwds, groups=None):
+def command_references_workspace(command, workspace):
+    """Windows 命令行是否以完整路径边界引用指定工作目录。"""
+    if not isinstance(command, str) or not isinstance(workspace, str):
+        return False
+    try:
+        expected = os.path.normcase(os.path.realpath(workspace))
+    except OSError:
+        expected = workspace
+    expected = re.sub(r"\\+", r"\\", expected.replace("/", "\\")).rstrip("\\")
+    source = re.sub(r"\\+", r"\\", command.replace("/", "\\")).casefold()
+    if not expected:
+        return False
+    start = 0
+    while True:
+        found = source.find(expected, start)
+        if found < 0:
+            return False
+        before = source[found - 1] if found else ""
+        after_at = found + len(expected)
+        after = source[after_at] if after_at < len(source) else ""
+        if ((not before or not (before.isalnum() or before in "._-"))
+                and (not after or not (after.isalnum() or after in "._-"))):
+            return True
+        start = found + 1
+
+
+def recovered_restart_pid(app, listeners=None, snap=None):
+    """识别 Windows 中由 Codex 外部重启、但仍可证明归属同一项目的服务。
+
+    Windows 不能直接读取进程 cwd。对于 Codex 已同步的项目卡片，唯一端口
+    监听者若属于当前用户且命令行带有该服务工作目录，即可证明仍是同一项目；
+    旧版完整命令指纹仅作目录未出现在命令行时的兼容兜底。其他项目、没有
+    唯一路径证据或多个监听者仍按外部端口占用处理。
+    """
+    project = project_metadata_from_app(app)
+    sync = app.get("sync") if isinstance(app.get("sync"), dict) else {}
+    codex_project = (sync.get("origin") == "codex"
+                     or str((project or {}).get("key") or "").startswith("codex:"))
+    if not IS_WINDOWS or not codex_project or not project:
+        return None
+    port = app.get("port")
+    signature = app.get("restartSignature")
+    workspace = app.get("cwd")
+    if not isinstance(port, int) or port <= 0:
+        return None
+    if listeners is None:
+        listeners = scan_listeners()
+    port_pids = sorted({pid for pid, listening_port in listeners
+                        if listening_port == port})
+    if len(port_pids) != 1:
+        return None
+    pid = port_pids[0]
+    if snap is None:
+        snap = ps_snapshot({pid}, with_uid=True)
+    info = snap.get(pid, {})
+    source = (info.get("args") or info.get("comm") or "").strip()
+    proven_workspace = command_references_workspace(source, workspace)
+    matching_legacy_signature = (
+        isinstance(signature, str) and bool(signature)
+        and process_signature(info) == signature)
+    if (info.get("uid") != SELF_UID or not source
+            or not (proven_workspace or matching_legacy_signature)):
+        return None
+    return pid
+
+
+def listener_app_owners(apps, listeners, snap, cwds, groups=None,
+                        process_snapshot=None):
     """返回真实受管监听进程的 ``pid -> app`` 映射。
 
     端口只是配置与网络资源，不能作为进程所有权证明。映射沿用应用状态的
     run token / PGID / UID 校验，并为升级前的进程保留严格 legacy 识别。
     如果异常配置让同一 PID 同时命中多张卡片，则不做关联，避免误导 UI。
     """
-    managed, _, _ = managed_process_index(apps, groups)
+    managed, _, _ = managed_process_index(apps, groups, process_snapshot)
     candidates = {}
     for app in apps:
         live = managed.get(app.get("id"), [])
         if not live:
             legacy_pid = legacy_managed_pid(app, listeners, snap, cwds)
             live = [legacy_pid] if legacy_pid else []
+        if not live:
+            restart_pid = recovered_restart_pid(app, listeners, snap)
+            live = [restart_pid] if restart_pid else []
         for pid in live:
             candidates.setdefault(pid, []).append(app)
     return {
@@ -1154,7 +1499,7 @@ def listener_app_owners(apps, listeners, snap, cwds, groups=None):
     }
 
 
-def build_apps(cfg, listeners, groups=None):
+def build_apps(cfg, listeners, groups=None, process_snapshot=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
     多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
@@ -1164,7 +1509,8 @@ def build_apps(cfg, listeners, groups=None):
     for pid, port in listeners:
         port_map.setdefault(port, []).append(pid)
     apps_cfg = cfg.get("apps") or []
-    managed, snap, _ = managed_process_index(apps_cfg, groups)
+    managed, snap, _ = managed_process_index(
+        apps_cfg, groups, process_snapshot)
     listen_by_pid = {}
     for pid, port in listeners:
         listen_by_pid.setdefault(pid, []).append(port)
@@ -1174,21 +1520,34 @@ def build_apps(cfg, listeners, groups=None):
     # 端口诊断需要展示占用者的真实身份，一次批量取详情，避免逐卡 ps。
     configured_listener_pids = {
         pid for port in configured_ports for pid in port_map.get(port, [])}
-    listener_snap = (ps_snapshot(configured_listener_pids, with_uid=True)
-                     if configured_listener_pids else {})
+    if process_snapshot is not None:
+        listener_snap = {
+            pid: process_snapshot[pid] for pid in configured_listener_pids
+            if pid in process_snapshot
+        }
+    else:
+        listener_snap = (ps_snapshot(configured_listener_pids, with_uid=True)
+                         if configured_listener_pids else {})
     listener_cwds = lsof_cwds(configured_listener_pids)
     verified_owner = listener_app_owners(
-        apps_cfg, listeners, listener_snap, listener_cwds)
+        apps_cfg, listeners, listener_snap, listener_cwds, groups,
+        process_snapshot)
 
     apps = []
     for app in apps_cfg:
         managed_live = managed.get(app["id"], [])
         legacy_pid = None if managed_live else legacy_managed_pid(
             app, listeners, listener_snap, listener_cwds)
+        restart_pid = None if (managed_live or legacy_pid) else recovered_restart_pid(
+            app, listeners, listener_snap)
         if (legacy_pid and
                 (verified_owner.get(legacy_pid) or {}).get("id") != app.get("id")):
             legacy_pid = None
-        live = managed_live or ([legacy_pid] if legacy_pid else [])
+        if (restart_pid and
+                (verified_owner.get(restart_pid) or {}).get("id") != app.get("id")):
+            restart_pid = None
+        live = managed_live or ([legacy_pid] if legacy_pid else []) or \
+            ([restart_pid] if restart_pid else [])
         lp = app.get("lastPid")
         pid = lp if lp in live else (live[0] if live else None)
         port = app.get("port")
@@ -1238,6 +1597,9 @@ def build_apps(cfg, listeners, groups=None):
                           if pid else None),
             "kind": app.get("kind") or "service",
             "attached": bool(app.get("attached")),
+            "autoOpen": bool(app.get("autoOpen")),
+            "sync": app.get("sync"),
+            "project": app.get("project"),
             "lastExit": public_last_exit(app),
             "health": health,
             "ports": actual_ports,
@@ -1251,32 +1613,45 @@ def build_apps(cfg, listeners, groups=None):
             "portConflict": False,
             "portConflictApps": [],
             "legacyManaged": bool(legacy_pid),
+            "recoveredExternal": bool(restart_pid),
         })
     return apps
 
 
 def build_state(cfg, console_port, config_health=None):
     degraded_reasons = []
-    # 一次 pgid 快照供 build_services / build_apps 共享，避免每轮两次全量 ps。
+    # Windows 上仅采样监听进程与受管树，避免每 2 秒全量 WMI 读取所有进程
+    # 命令行；全量查询会在进程较多时阻塞 /api/state，触发前端断连提示。
+    listeners = scan_listeners()
     needs_groups = any(
         app.get("runToken")
         and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
         for app in cfg.get("apps") or [])
-    groups = pgid_members_map() if needs_groups else None
+    if IS_WINDOWS:
+        roots = {
+            app.get("lastPgid") or app.get("lastPid")
+            for app in cfg.get("apps") or [] if app.get("runToken")
+        }
+        listener_pids = {pid for pid, _ in listeners}
+        process_snapshot = windows_process_tree_snapshot(roots, listener_pids)
+    else:
+        process_snapshot = None
+    groups = (pgid_members_map(process_snapshot) if needs_groups else None)
     try:
-        services, listeners = build_services(cfg, groups)
+        services, listeners = build_services(
+            cfg, groups, listeners, process_snapshot)
     except Exception as e:
         LOG.exception("构建服务监控状态失败")
         services, listeners = [], set()
         degraded_reasons.append({"component": "services"})
     try:
-        watched = build_watched(cfg.get("watchedKeywords"))
+        watched = build_watched(cfg.get("watchedKeywords"), process_snapshot)
     except Exception as e:
         LOG.exception("构建关注进程状态失败")
         watched = []
         degraded_reasons.append({"component": "watched"})
     try:
-        apps = build_apps(cfg, listeners, groups)
+        apps = build_apps(cfg, listeners, groups, process_snapshot)
     except Exception as e:
         LOG.exception("构建启动台状态失败")
         apps = []
@@ -1310,12 +1685,27 @@ def build_state(cfg, console_port, config_health=None):
 # 第二个请求直接命中缓存）。配置/进程变更时 invalidate 立即失效。
 STATE_CACHE_TTL = 2.2  # 秒
 _state_cache_lock = threading.Lock()
-_state_cache = {"mono": 0.0, "state": None}
+_state_cache = {"mono": 0.0, "state": None, "refreshing": False}
 
 
 def invalidate_state_cache():
     with _state_cache_lock:
-        _state_cache["state"] = None
+        # 保留上一份可用快照，刷新期间继续给页面返回它，避免慢速进程探测
+        # 被误报为“控制台连接断开”。
+        _state_cache["mono"] = 0.0
+
+
+def _refresh_state_snapshot(cfg, console_port):
+    try:
+        state = build_state(cfg.snapshot(), console_port, cfg.health_info())
+        with _state_cache_lock:
+            _state_cache["mono"] = time.monotonic()
+            _state_cache["state"] = state
+    except Exception:
+        LOG.exception("刷新状态快照失败")
+    finally:
+        with _state_cache_lock:
+            _state_cache["refreshing"] = False
 
 
 def get_state_snapshot(cfg, console_port):
@@ -1324,10 +1714,28 @@ def get_state_snapshot(cfg, console_port):
         cached = _state_cache["state"]
         if cached is not None and now - _state_cache["mono"] < STATE_CACHE_TTL:
             return cached
+        if cached is not None:
+            if not _state_cache.get("refreshing"):
+                _state_cache["refreshing"] = True
+                threading.Thread(
+                    target=_refresh_state_snapshot,
+                    args=(cfg, console_port), daemon=True).start()
+            return cached
+        # 首次加载没有旧快照可返回，仍同步构建一次；run_cmd 的超时路径已
+        # 保证 Windows WMI 异常也不会无限阻塞这个请求。
+        if not _state_cache.get("refreshing"):
+            _state_cache["refreshing"] = True
+        else:
+            return build_state(cfg.snapshot(), console_port, cfg.health_info())
+    try:
         state = build_state(cfg.snapshot(), console_port, cfg.health_info())
-        _state_cache["mono"] = time.monotonic()
-        _state_cache["state"] = state
+        with _state_cache_lock:
+            _state_cache["mono"] = time.monotonic()
+            _state_cache["state"] = state
         return state
+    finally:
+        with _state_cache_lock:
+            _state_cache["refreshing"] = False
 
 
 def build_health(cfg):
@@ -1345,7 +1753,7 @@ def build_health(cfg):
         else:
             try:
                 mode = os.lstat(path).st_mode
-                if stat.S_ISLNK(mode) or mode & 0o077:
+                if stat.S_ISLNK(mode) or (not IS_WINDOWS and mode & 0o077):
                     issues.append("%s 目录权限不是 0700" % label)
             except OSError as e:
                 issues.append("无法检查 %s 目录: %s" % (label, e))
@@ -1360,7 +1768,7 @@ def build_health(cfg):
         except OSError as e:
             issues.append("无法检查 %s: %s" % (label, e))
             continue
-        if not stat.S_ISREG(mode) or mode & 0o077:
+        if not stat.S_ISREG(mode) or (not IS_WINDOWS and mode & 0o077):
             issues.append("%s 文件权限不是 0600" % label)
     degraded = bool(issues)
     snapshot = cfg.snapshot()
@@ -1411,6 +1819,12 @@ def list_themes():
 
 def process_uid(pid):
     """返回进程 uid；进程不存在返回 None。"""
+    if IS_WINDOWS:
+        script = ("$proc=Get-CimInstance Win32_Process -Filter 'ProcessId=%d'; "
+                  "if($proc){(Invoke-CimMethod -InputObject $proc -MethodName GetOwner).User}" % int(pid))
+        owner = run_cmd([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]).strip()
+        return owner.casefold() if owner else None
     out = run_cmd(["ps", "-o", "uid=", "-p", str(int(pid))])
     toks = out.split()
     if not toks:
@@ -1419,6 +1833,12 @@ def process_uid(pid):
         return int(toks[0])
     except ValueError:
         return None
+
+
+def process_signature(info):
+    """返回外部进程的稳定命令行指纹，用于 Windows 的显式认领校验。"""
+    source = (info.get("args") or info.get("comm") or "").strip()
+    return hashlib.sha256(source.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def kill_process(pid, force):
@@ -1430,6 +1850,13 @@ def kill_process(pid, force):
         return False, "进程不存在"
     if uid != SELF_UID:
         return False, "只能结束当前用户的进程"
+    if IS_WINDOWS:
+        result = subprocess.run(
+            ["taskkill.exe", "/PID", str(int(pid)), "/F"],
+            capture_output=True, text=True, errors="replace")
+        if result.returncode:
+            return False, "结束失败: %s" % (result.stderr.strip() or result.stdout.strip())
+        return True, None
     sig = signal.SIGKILL if force else signal.SIGTERM
     try:
         os.kill(pid, sig)
@@ -1450,6 +1877,14 @@ def stop_pid_tree(pid, sig=signal.SIGTERM):
     failures must never be swallowed: callers use them to retain management
     identity instead of creating an orphan process.
     """
+    if IS_WINDOWS:
+        result = subprocess.run(
+            ["taskkill.exe", "/PID", str(int(pid)), "/T", "/F"],
+            capture_output=True, text=True, errors="replace")
+        if result.returncode and pid_alive(pid):
+            return False, "停止受控进程树失败: %s" % (
+                result.stderr.strip() or result.stdout.strip())
+        return True, None
     try:
         os.killpg(int(pid), sig)
         return True, None
@@ -1462,7 +1897,9 @@ def stop_pid_tree(pid, sig=signal.SIGTERM):
 
 
 def app_running(app, listeners=None):
-    return bool(managed_pids(app) or legacy_managed_pid(app, listeners))
+    return bool(managed_pids(app)
+                or legacy_managed_pid(app, listeners)
+                or recovered_restart_pid(app, listeners))
 
 
 def app_alive_sign(app, listeners=None):
@@ -1487,6 +1924,13 @@ def build_launch_env(token, environ=None):
         "/opt/homebrew/bin", "/opt/homebrew/sbin",
         "/usr/local/bin", "/usr/local/sbin",
     ]
+    if IS_WINDOWS:
+        preferred.extend([
+            os.path.join(home, "AppData", "Roaming", "npm"),
+            os.path.join(home, ".cargo", "bin"),
+            os.path.join(home, ".dotnet", "tools"),
+            os.path.join(os.environ.get("ProgramFiles", ""), "nodejs"),
+        ])
     preferred.extend(sorted(
         glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin")),
         reverse=True))
@@ -1494,11 +1938,13 @@ def build_launch_env(token, environ=None):
         glob.glob(os.path.join(home, ".fnm", "node-versions", "*", "installation", "bin")),
         reverse=True))
     preferred.extend((env.get("PATH") or "").split(os.pathsep))
-    preferred.extend(("/usr/bin", "/bin", "/usr/sbin", "/sbin"))
+    if not IS_WINDOWS:
+        preferred.extend(("/usr/bin", "/bin", "/usr/sbin", "/sbin"))
     seen = set()
     env["PATH"] = os.pathsep.join(
         path for path in preferred if path and not (path in seen or seen.add(path)))
-    env.setdefault("PNPM_HOME", os.path.join(home, "Library", "pnpm"))
+    env.setdefault("PNPM_HOME", os.path.join(
+        home, "AppData", "Local", "pnpm") if IS_WINDOWS else os.path.join(home, "Library", "pnpm"))
     env[RUN_TOKEN_ENV] = token
     return env
 
@@ -1512,7 +1958,8 @@ def start_app(app):
     try:
         log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
                          0o600)
-        os.fchmod(log_fd, 0o600)
+        if not IS_WINDOWS:
+            os.fchmod(log_fd, 0o600)
         logf = os.fdopen(log_fd, "ab", buffering=0)
     except OSError as e:
         return False, "无法打开日志文件: %s" % e, None, None, None
@@ -1522,15 +1969,33 @@ def start_app(app):
     # 外层 shell 在 argv[0] 中持有随机标记并等待内层；内层等待用户命令
     # 留下的后台作业。因此进程组既可验证，也不会因启动脚本过早退出而失去锚点。
     outer_script = '/bin/bash -c "$1"\nconsole_status=$?\nexit "$console_status"'
-    inner_script = (app["command"] +
+    app_command = app["command"]
+    if (IS_WINDOWS and re.match(r"^\s*python3(?=\s|$)", app_command)
+            and not windows_command_exists("python3")
+            and windows_command_exists("python")):
+        # Preserve existing macOS-era cards after moving the console to
+        # Windows. New project detection emits `python`, but old `python3`
+        # commands should remain runnable when the launcher is named python.
+        app_command = re.sub(r"^\s*python3(?=\s|$)", "python", app_command,
+                             count=1)
+    inner_script = (app_command +
                     '\nconsole_status=$?\nwait\nexit "$console_status"')
     try:
         header = "\n===== 启动于 %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S")
         logf.write(header.encode("utf-8"))
-        proc = subprocess.Popen(
-            ["/bin/bash", "-c", outer_script, marker, inner_script],
-            cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
-            start_new_session=True, env=env)
+        if IS_WINDOWS:
+            command = ("$null = '%s'; $env:%s='%s'; & { %s }; exit $LASTEXITCODE" %
+                       (marker, RUN_TOKEN_ENV, token, app_command))
+            proc = subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-NonInteractive",
+                 "-ExecutionPolicy", "Bypass", "-Command", command],
+                cwd=cwd, stdout=logf, stderr=subprocess.STDOUT, env=env,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            proc = subprocess.Popen(
+                ["/bin/bash", "-c", outer_script, marker, inner_script],
+                cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
+                start_new_session=True, env=env)
     except Exception as e:
         logf.close()
         return False, "启动失败: %s" % e, None, None, None
@@ -1596,6 +2061,10 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
             target["lastPgid"] = pgid
             target["runToken"] = token
             target["attached"] = False
+            target["attachSignature"] = None
+            # 指纹仅可来自本次受控启动的实际监听进程；旧值不能跨命令、
+            # 工作目录或端口变更继续用于外部重启关联。
+            target["restartSignature"] = None
             # 批处理任务运行时先保留上一次结果；自然退出或手动停止后再原子覆盖。
             if (target.get("kind") or "service") != "task":
                 target["lastExit"] = None
@@ -1604,7 +2073,134 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
     saved = cfg.update(op)
     if saved:
         watch_app_exit(cfg, app_id, proc, token, started_at)
+        schedule_restart_signature_capture(cfg, app_id, token)
     return saved
+
+
+def capture_restart_signature_when_ready(
+        cfg, app_id, token, timeout=RESTART_SIGNATURE_CAPTURE_SEC):
+    """在受控服务就绪后记录其 Windows 监听命令指纹。"""
+    if not IS_WINDOWS:
+        return False
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        app = find_app(cfg.snapshot(), app_id)
+        if (not app or app.get("runToken") != token
+                or not project_metadata_from_app(app)):
+            return False
+        port = app.get("port")
+        if isinstance(port, int) and port > 0:
+            try:
+                listeners = scan_listeners()
+                managed = set(managed_pids(app))
+                pids = {pid for pid, listening_port in listeners
+                        if listening_port == port and pid in managed}
+                if len(pids) == 1:
+                    pid = next(iter(pids))
+                    info = ps_snapshot({pid}, with_uid=True).get(pid, {})
+                    source = (info.get("args") or info.get("comm") or "").strip()
+                    if info.get("uid") == SELF_UID and source:
+                        signature = process_signature(info)
+
+                        def op(data):
+                            target = find_app(data, app_id)
+                            if (target and target.get("runToken") == token
+                                    and target.get("restartSignature") != signature):
+                                target["restartSignature"] = signature
+
+                        cfg.update(op)
+                        return True
+            except Exception as exc:
+                LOG.warning("采集服务重启指纹失败（%s）：%s", app_id, exc)
+                return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(FRONTEND_OPEN_POLL_SEC,
+                       max(0.0, deadline - time.monotonic())))
+
+
+def schedule_restart_signature_capture(cfg, app_id, token):
+    """异步采集外部重启恢复所需的监听进程指纹。"""
+    if not IS_WINDOWS:
+        return False
+    thread = threading.Thread(
+        target=capture_restart_signature_when_ready,
+        args=(cfg, app_id, token), daemon=True)
+    thread.start()
+    return True
+
+
+def is_frontend_app(app):
+    """判断一个长期服务是否应在就绪后自动打开本机页面。"""
+    if (app.get("kind") or "service") == "task":
+        return False
+    if app.get("autoOpen") is True:
+        return True
+    sync = app.get("sync") if isinstance(app.get("sync"), dict) else {}
+    if sync.get("role") == "frontend":
+        return True
+    if sync.get("role"):
+        return False
+    command = str(app.get("command") or "").lower()
+    return any(marker in command for marker in (
+        "vite", "next", "nuxt", "astro", "react-scripts",
+        "webpack-dev-server", "vue-cli-service", "sveltekit",
+        "npm run dev", "pnpm run dev", "yarn dev", "bun run dev"))
+
+
+def open_frontend_when_ready(cfg, app_id, token, configured_port,
+                             timeout=FRONTEND_OPEN_WAIT_SEC):
+    """等待受控前端实际监听端口后，在默认浏览器中打开页面。"""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        app = find_app(cfg.snapshot(), app_id)
+        if (not app or app.get("runToken") != token
+                or not is_frontend_app(app)
+                or app.get("port") != configured_port):
+            return False
+        try:
+            listeners = scan_listeners()
+            live = set(managed_pids(app))
+        except Exception as exc:
+            LOG.warning("等待前端服务就绪时读取进程状态失败（%s）：%s", app_id, exc)
+            return False
+        if configured_port:
+            port = configured_port
+            owners = {pid for pid in live if (pid, port) in listeners}
+        else:
+            owned_listeners = sorted(
+                (port, pid) for pid, port in listeners if pid in live)
+            port = owned_listeners[0][0] if owned_listeners else None
+            owners = ({pid for listener_port, pid in owned_listeners
+                       if listener_port == port} if port else set())
+        if owners:
+            host = listener_open_host(listeners, port, owners) or HOST
+            url = "http://%s:%d/" % (host, port)
+            try:
+                webbrowser.open(url, new=2)
+                LOG.info("前端服务已就绪，打开页面：%s", url)
+            except Exception as exc:
+                LOG.warning("打开前端页面失败（%s）：%s", app_id, exc)
+                return False
+            return True
+        if time.monotonic() >= deadline:
+            target = str(configured_port) if configured_port else "任意受管端口"
+            LOG.info("前端服务未在 %.1f 秒内监听%s：%s",
+                     timeout, target, app_id)
+            return False
+        time.sleep(min(FRONTEND_OPEN_POLL_SEC,
+                       max(0.0, deadline - time.monotonic())))
+
+
+def schedule_frontend_open(cfg, app, token):
+    """在前端服务启动后异步等待就绪；返回是否已安排自动打开。"""
+    if not is_frontend_app(app):
+        return False
+    thread = threading.Thread(
+        target=open_frontend_when_ready,
+        args=(cfg, app["id"], token, app["port"]), daemon=True)
+    thread.start()
+    return True
 
 
 def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
@@ -1619,6 +2215,7 @@ def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
         target["lastPgid"] = None
         target["runToken"] = None
         target["attached"] = False
+        target["attachSignature"] = None
         if last_exit is not None:
             target["lastExit"] = last_exit
         return True
@@ -1633,15 +2230,44 @@ def stop_app_for_update(cfg, app, timeout=5.0):
     return ok, error, bool(ok)
 
 
+class PickPathError(RuntimeError):
+    pass
+
+
 def pick_path(what):
-    """macOS 原生文件/目录选择框（osascript）。返回 (path|None, canceled)。"""
+    """返回用户选择的文件/目录路径；取消时返回 ``(None, True)``。"""
+    if IS_WINDOWS:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            root.lift()
+            root.focus_force()
+            if what == "dir":
+                path = filedialog.askdirectory(
+                    parent=root, title="总控台 - 选择工作目录",
+                    mustexist=True)
+            else:
+                path = filedialog.askopenfilename(
+                    parent=root, title="总控台 - 选择批处理脚本")
+        except Exception as e:
+            raise PickPathError("无法显示 Windows 系统选择窗口: %s" % e) from e
+        finally:
+            if "root" in locals():
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+        return (path or None), not bool(path)
     if what == "dir":
         script = 'POSIX path of (choose folder with prompt "选择工作目录")'
     else:
         script = 'POSIX path of (choose file with prompt "选择批处理脚本")'
     try:
         r = subprocess.run(["osascript", "-e", script],
-                           capture_output=True, text=True, timeout=180)
+                           capture_output=True, text=True, timeout=300)
     except Exception:
         return None, False
     if r.returncode != 0:  # 用户按了取消（"User canceled."）
@@ -1652,10 +2278,15 @@ def pick_path(what):
 def command_for_script(path):
     """按脚本类型生成可直接保存的 shell 命令，并安全引用任意文件名。"""
     normalized = os.path.abspath(os.path.expanduser(str(path)))
-    quoted = shlex.quote(normalized)
+    quoted = ("'" + normalized.replace("'", "''") + "'"
+              if IS_WINDOWS else shlex.quote(normalized))
     suffix = os.path.splitext(normalized)[1].lower()
     if suffix == ".py":
-        return "python3 -- %s" % quoted
+        return ("python -- %s" if IS_WINDOWS else "python3 -- %s") % quoted
+    if IS_WINDOWS and suffix in (".ps1", ".psm1"):
+        return "& %s" % quoted
+    if IS_WINDOWS and suffix in (".bat", ".cmd"):
+        return "cmd.exe /d /c %s" % quoted
     if suffix == ".zsh":
         return "/bin/zsh -- %s" % quoted
     if suffix in (".sh", ".bash"):
@@ -1666,7 +2297,7 @@ def command_for_script(path):
     return "/bin/bash -- %s" % quoted
 
 
-SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".command"}
+SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".command", ".ps1", ".bat", ".cmd"}
 SHELL_BUILTINS = {
     ".", ":", "[", "alias", "break", "cd", "command", "continue", "echo",
     "eval", "exec", "exit", "export", "false", "printf", "pwd", "read",
@@ -1675,10 +2306,31 @@ SHELL_BUILTINS = {
 }
 
 
+def windows_command_exists(command):
+    """在 PowerShell 运行空间中确认 cmdlet、函数、别名或可执行文件。"""
+    if not IS_WINDOWS:
+        return False
+    if not command or re.search(r"[;&|<>]", command):
+        return False
+    launch_path = build_launch_env("health-check").get("PATH")
+    if shutil.which(command, path=launch_path):
+        return True
+    script = ("if (Get-Command -Name '%s' -ErrorAction SilentlyContinue) { exit 0 }; exit 1" %
+              command.replace("'", "''"))
+    try:
+        return subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, timeout=SUBPROCESS_TIMEOUT).returncode == 0
+    except OSError:
+        return False
+
+
 def _simple_command_tokens(command):
     """解析无管道/重定向/展开的简单命令；不确定时返回 None。"""
     if not isinstance(command, str) or not command.strip():
         return []
+    if IS_WINDOWS:
+        return _windows_simple_command_tokens(command)
     try:
         lexer = shlex.shlex(
             command, posix=True, punctuation_chars="|&;<>()")
@@ -1699,6 +2351,58 @@ def _simple_command_tokens(command):
     return tokens
 
 
+def _windows_simple_command_tokens(command):
+    """解析有限的 PowerShell 命令，保留 Windows 路径和单引号转义。
+
+    健康检查只接受无管道、无变量展开的静态命令。PowerShell 的单引号以
+    ``''`` 转义，与 POSIX ``shlex`` 规则不同，必须自行处理，否则带撇号
+    的文件路径会被错误拼接并误报配置失效。
+    """
+    command = command.strip()
+    invoke_operator = command.startswith("&")
+    if invoke_operator:
+        command = command[1:].lstrip()
+    tokens, current = [], []
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote:
+            if char == quote:
+                if quote == "'" and index + 1 < len(command) and command[index + 1] == "'":
+                    current.append("'")
+                    index += 2
+                    continue
+                quote = None
+            else:
+                current.append(char)
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+        elif char in ";|<>()&":
+            return None
+        elif char == "`":
+            # Backtick has several context-sensitive PowerShell meanings;
+            # treating it as dynamic is safer than attempting partial expansion.
+            return None
+        else:
+            current.append(char)
+        index += 1
+    if quote:
+        return None
+    if current:
+        tokens.append("".join(current))
+    if any(any(char in token for char in ("$", "*", "?", "[", "]"))
+           for token in tokens):
+        return None
+    return (["&"] if invoke_operator else []) + tokens
+
+
 def _resolve_command_path(value, cwd):
     value = os.path.expanduser(value)
     if os.path.isabs(value):
@@ -1714,6 +2418,8 @@ def _script_target(tokens, cwd):
     while index < len(tokens) and re.fullmatch(
             r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
         index += 1
+    if IS_WINDOWS and index < len(tokens) and tokens[index] == "&":
+        index += 1
     if index >= len(tokens):
         return None, False, False
     executable = tokens[index]
@@ -1728,6 +2434,13 @@ def _script_target(tokens, cwd):
         candidate = next((arg for arg in args if not arg.startswith("-")), None)
         if candidate and (os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES
                           or "/" in candidate):
+            return (_resolve_command_path(candidate, cwd), False,
+                    not os.path.isabs(os.path.expanduser(candidate)))
+        return None, False, False
+
+    if IS_WINDOWS and base.casefold() in {"cmd", "cmd.exe"}:
+        candidate = next((arg for arg in args if not arg.startswith("/")), None)
+        if candidate and os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES:
             return (_resolve_command_path(candidate, cwd), False,
                     not os.path.isabs(os.path.expanduser(candidate)))
         return None, False, False
@@ -1810,6 +2523,15 @@ def inspect_app_health(app):
                 "edit-command",
             )
 
+    # 工作目录丢失时，不能从相对命令得出运行时不存在的结论；只报告
+    # 可确定的目录问题，避免同一根因产生两条误导性阻断提示。
+    if configured_cwd and not cwd_ok and script_was_relative:
+        return {
+            "status": "error",
+            "blocking": True,
+            "issues": issues,
+        }
+
     # 直接脚本已由上面的文件检查覆盖；其他简单命令检查首个运行时。
     index = 0
     while tokens and index < len(tokens) and re.fullmatch(
@@ -1821,6 +2543,9 @@ def inspect_app_health(app):
         if "/" in executable:
             runtime = _resolve_command_path(executable, cwd)
             runtime_ok = os.path.isfile(runtime) and os.access(runtime, os.X_OK)
+        elif IS_WINDOWS:
+            runtime = executable
+            runtime_ok = windows_command_exists(executable)
         else:
             runtime = executable
             runtime_ok = bool(shutil.which(
@@ -1895,7 +2620,26 @@ def _package_default_port(script_name, command, dependencies):
     return None
 
 
-def detect_project(root):
+def _candidate_role(candidate, role_hint=None):
+    """为项目候选赋予展示和同步用的服务角色。"""
+    if role_hint:
+        return role_hint
+    haystack = " ".join(str(candidate.get(key) or "")
+                         for key in ("command", "source", "label")).lower()
+    if any(token in haystack for token in ("pyside", "pyqt", "桌面应用")):
+        return "desktop"
+    if "docker compose" in haystack:
+        return "stack"
+    if any(token in haystack for token in
+           ("python", "django", "fastapi", "flask", "streamlit", "uvicorn")):
+        return "backend"
+    if any(token in haystack for token in
+           ("npm", "pnpm", "yarn", "bun", "hexo", "hugo", "jekyll", "node")):
+        return "frontend"
+    return "service"
+
+
+def detect_project(root, _nested=False, _role_hint=None):
     """只读分析项目根目录，返回可由启动台直接使用的启动候选。"""
     if not isinstance(root, str) or not root.strip():
         return None, "请选择项目文件夹"
@@ -2027,12 +2771,13 @@ def detect_project(root):
     if requirements is not None:
         note_file("requirements.txt", requirements)
     py_deps = "\n".join(text for text in (pyproject, requirements) if text).lower()
-    python_runner = "uv run" if os.path.isfile(os.path.join(root, "uv.lock")) else "python3 -m"
+    python_executable = "python" if IS_WINDOWS else "python3"
+    python_runner = "uv run" if os.path.isfile(os.path.join(root, "uv.lock")) else python_executable + " -m"
     if os.path.isfile(os.path.join(root, "uv.lock")):
         note_file("uv.lock")
     if os.path.isfile(os.path.join(root, "manage.py")):
         note_file("manage.py")
-        prefix = "uv run python" if python_runner == "uv run" else "python3"
+        prefix = "uv run python" if python_runner == "uv run" else python_executable
         add(prefix + " manage.py runserver", "Django 开发服务器", "manage.py", 8000, 20)
     else:
         for module_file in ("app.py", "main.py", "server.py"):
@@ -2048,22 +2793,48 @@ def detect_project(root):
                 r"(?m)^\s*(?:import\s+flask\b|from\s+flask\b)", module_text)
             if "streamlit" in py_deps or imports_streamlit:
                 note_file(module_file, module_text)
-                prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                prefix = "uv run" if python_runner == "uv run" else python_executable + " -m"
                 add(prefix + " streamlit run " + module_file,
                     "Streamlit 应用", module_file, 8501, 22)
                 break
             if "fastapi" in py_deps or imports_fastapi:
                 note_file(module_file, module_text)
-                prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                prefix = "uv run" if python_runner == "uv run" else python_executable + " -m"
                 add(prefix + " uvicorn %s:app --reload" % module,
                     "FastAPI 开发服务器", module_file, 8000, 23)
                 break
             if "flask" in py_deps or imports_flask:
                 note_file(module_file, module_text)
-                prefix = "uv run" if python_runner == "uv run" else "python3 -m"
+                prefix = "uv run" if python_runner == "uv run" else python_executable + " -m"
                 add(prefix + " flask --app %s run --debug" % module,
                     "Flask 开发服务器", module_file, 5000, 24)
                 break
+
+        # Qt 桌面程序是长期运行的受控应用，但不应伪造 HTTP 端口。
+        for module_file in ("app.py", "main.py", "server.py"):
+            module_text = _read_project_text(root, module_file)
+            if module_text is None or not re.search(
+                    r"(?m)^\s*(?:import\s+(?:PySide[26]|PyQt[56])\b|"
+                    r"from\s+(?:PySide[26]|PyQt[56])\b)", module_text):
+                continue
+            note_file(module_file, module_text)
+            module_path = os.path.join(root, module_file)
+            venv_python = os.path.join(
+                root, ".venv", "Scripts" if IS_WINDOWS else "bin",
+                "python.exe" if IS_WINDOWS else "python")
+            if os.path.isfile(venv_python):
+                if IS_WINDOWS:
+                    command = "& '%s' -- '%s'" % (
+                        venv_python.replace("'", "''"),
+                        module_path.replace("'", "''"))
+                else:
+                    command = "%s -- %s" % (
+                        shlex.quote(venv_python), shlex.quote(module_path))
+            else:
+                command = command_for_script(module_path)
+            add(command, "Qt 桌面应用", module_file, None, 25,
+                "长期运行的本地桌面应用，不监听网络端口")
+            break
 
     # Docker Compose、Go、Rust 和已有的常用启动脚本。
     compose_name = next((name for name in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
@@ -2085,10 +2856,13 @@ def detect_project(root):
         note_file("Cargo.toml")
         add("cargo run", "Rust 项目", "Cargo.toml", None, 61)
 
-    for script_name in ("start.command", "dev.command", "run.command", "start.sh", "dev.sh", "run.sh"):
+    script_names = (("start.ps1", "dev.ps1", "run.ps1", "start.bat", "dev.bat", "run.bat")
+                    if IS_WINDOWS else
+                    ("start.command", "dev.command", "run.command", "start.sh", "dev.sh", "run.sh"))
+    for script_name in script_names:
         if os.path.isfile(os.path.join(root, script_name)):
             note_file(script_name)
-            add("bash %s" % shlex.quote("./" + script_name),
+            add(command_for_script(os.path.join(root, script_name)),
                 "现有启动脚本", script_name, None, 70,
                 "也可以继续使用“选择脚本”手动指定")
             break
@@ -2096,16 +2870,229 @@ def detect_project(root):
     # 纯静态站点最后兜底，避免把 Vite/Next 等项目误当成普通文件目录。
     if not candidates and os.path.isfile(os.path.join(root, "index.html")):
         note_file("index.html")
-        add("python3 -m http.server 8000", "静态网站预览", "index.html", 8000, 90)
+        add(python_executable + " -m http.server 8000", "静态网站预览", "index.html", 8000, 90)
 
     candidates.sort(key=lambda item: item.pop("_priority"))
+    normalized_root = os.path.normcase(os.path.realpath(root))
+    for candidate in candidates:
+        candidate["cwd"] = normalized_root
+        candidate["role"] = _candidate_role(candidate, _role_hint)
+        candidate["serviceKey"] = codex_service_sync_key(
+            candidate["role"], normalized_root, candidate["source"])
+
+    # 多服务仓库只探测项目根目录与明确约定的一层目录；不递归扫描，避免
+    # 读取 node_modules、构建目录或工作区中无关的子项目。
+    if not _nested:
+        for directory, role in (
+                ("frontend", "frontend"), ("client", "frontend"),
+                ("web", "frontend"), ("ui", "frontend"),
+                ("backend", "backend"), ("api", "backend"),
+                ("server", "backend")):
+            child = os.path.join(root, directory)
+            if not os.path.isdir(child):
+                continue
+            child_detected, child_error = detect_project(
+                child, _nested=True, _role_hint=role)
+            if not child_error and child_detected:
+                candidates.extend(child_detected["candidates"])
     return {
         "ok": True,
         "cwd": root,
         "name": os.path.basename(root) or root,
         "files": detected_files,
-        "candidates": candidates[:8],
+        "candidates": candidates[:24],
     }, None
+
+
+def codex_project_sync_key(cwd):
+    """返回跨会话稳定的 Codex 项目同步键与规范化工作目录。"""
+    normalized = os.path.normcase(os.path.realpath(os.path.abspath(cwd)))
+    digest = hashlib.sha256(
+        normalized.encode("utf-8", "surrogatepass")).hexdigest()[:24]
+    return "codex:" + digest, normalized
+
+
+def project_metadata_from_app(app):
+    """读取应用所归属项目的可公开、可复用元数据。"""
+    project = app.get("project")
+    if isinstance(project, dict):
+        key = project.get("key")
+        if isinstance(key, str) and key:
+            return {
+                "key": key,
+                "name": str(project.get("name") or app.get("name") or "未命名项目"),
+                "cwd": project.get("cwd") or app.get("cwd"),
+            }
+    sync = app.get("sync")
+    if isinstance(sync, dict) and sync.get("origin") == "codex":
+        key = sync.get("projectKey") or sync.get("key")
+        if isinstance(key, str) and key:
+            return {
+                "key": key,
+                "name": str(sync.get("projectName") or app.get("name") or "未命名项目"),
+                "cwd": sync.get("projectPath") or app.get("cwd"),
+            }
+    return None
+
+
+def resolve_existing_project(cfg, project_key):
+    """把用户选择的键解析为现有项目；空键代表独立服务。"""
+    if project_key is None:
+        return None, None
+    for app in cfg.get("apps") or []:
+        project = project_metadata_from_app(app)
+        if project and project["key"] == project_key:
+            return project, None
+    return None, "目标项目不存在，请刷新后重新选择"
+
+
+def codex_service_sync_key(role, cwd, source):
+    """返回项目内一个可独立运行服务的稳定同步键。"""
+    payload = "\0".join((str(role or "service"),
+                           os.path.normcase(os.path.realpath(cwd)),
+                           str(source or "")))
+    return hashlib.sha256(
+        payload.encode("utf-8", "surrogatepass")).hexdigest()[:24]
+
+
+def _default_codex_sync_candidates(candidates):
+    """每个 (角色, 工作目录) 只保留最高优先级的长期服务候选。"""
+    selected = []
+    seen = set()
+    for candidate in candidates:
+        if candidate.get("kind") == "task":
+            continue
+        key = (candidate.get("role") or "service",
+               os.path.normcase(os.path.realpath(candidate.get("cwd") or "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(dict(candidate))
+    return selected
+
+
+def sync_codex_project(cfg, cwd, candidate_index=None):
+    """幂等登记 Codex 工作区的独立服务，绝不启动或覆盖手工配置。"""
+    detected, error = detect_project(cwd)
+    if error:
+        return None, error, 400
+    candidates = detected["candidates"]
+    if candidate_index is None:
+        selected = _default_codex_sync_candidates(candidates)
+        if not selected:
+            return None, "未识别到可同步的长期服务候选", 422
+    else:
+        if (not isinstance(candidate_index, int)
+                or isinstance(candidate_index, bool)
+                or candidate_index < 0
+                or candidate_index >= len(candidates)):
+            return None, "候选命令不存在，请先读取项目候选", 422
+        selected = [dict(candidates[candidate_index])]
+    project_key, normalized_cwd = codex_project_sync_key(detected["cwd"])
+    project = {
+        "key": project_key,
+        "name": detected["name"],
+        "cwd": normalized_cwd,
+    }
+    now = int(time.time())
+    result = {"apps": [], "created": [], "updated": [], "skipped": []}
+
+    def op(data):
+        used_ids = set()
+        apps = data.setdefault("apps", [])
+        for candidate in selected:
+            service_key = candidate["serviceKey"]
+            sync_key = project_key + ":" + service_key
+            app = next((item for item in apps
+                        if item.get("id") not in used_ids
+                        and isinstance(item.get("sync"), dict)
+                        and item["sync"].get("key") == sync_key), None)
+            if app is None:
+                app = next((item for item in apps
+                            if item.get("id") not in used_ids
+                            and isinstance(item.get("sync"), dict)
+                            and item["sync"].get("projectKey") == project_key
+                            and item["sync"].get("serviceKey") == service_key), None)
+            # 兼容早期“一项目一张卡片”同步记录：仅迁移一次到首个服务。
+            if app is None:
+                app = next((item for item in apps
+                            if item.get("id") not in used_ids
+                            and isinstance(item.get("sync"), dict)
+                            and item["sync"].get("key") == project_key), None)
+            if app is not None:
+                used_ids.add(app["id"])
+                prior_sync = dict(app.get("sync") or {})
+                app["sync"] = {
+                    **prior_sync,
+                    "key": sync_key,
+                    "origin": "codex",
+                    "projectKey": project_key,
+                    "projectName": detected["name"],
+                    "projectPath": normalized_cwd,
+                    "serviceKey": service_key,
+                    "role": candidate["role"],
+                    "lastSyncedAt": now,
+                    "candidate": candidate,
+                }
+                app["project"] = dict(project)
+                result["updated"].append(app["id"])
+                result["apps"].append(dict(app))
+                continue
+            app_id = secrets.token_hex(4)
+            while find_app(data, app_id):
+                app_id = secrets.token_hex(4)
+            app = {
+                "id": app_id,
+                "name": detected["name"] + " · " + candidate["role"],
+                "command": candidate["command"],
+                "cwd": candidate.get("cwd") or normalized_cwd,
+                "port": candidate["port"],
+                "emoji": None,
+                "glyph": "folder-git-2",
+                "icon": None,
+                "favicon": None,
+                "kind": candidate["kind"],
+                "lastPid": None,
+                "lastPgid": None,
+                "runToken": None,
+                "attached": False,
+                "attachSignature": None,
+                "restartSignature": None,
+                "sync": {
+                    "key": sync_key,
+                    "origin": "codex",
+                    "projectKey": project_key,
+                    "projectName": detected["name"],
+                    "projectPath": normalized_cwd,
+                    "serviceKey": service_key,
+                    "role": candidate["role"],
+                    "createdAt": now,
+                    "lastSyncedAt": now,
+                    "candidate": candidate,
+                },
+                "project": dict(project),
+                "lastExit": None,
+                "createdAt": now,
+            }
+            apps.append(app)
+            used_ids.add(app_id)
+            result["created"].append(app_id)
+            result["apps"].append(dict(app))
+
+    cfg.update(op)
+    return {
+        "ok": True,
+        "project": project,
+        "apps": result["apps"],
+        "app": result["apps"][0],  # 兼容旧版单卡片客户端
+        "created": bool(result["created"]),
+        "updated": bool(result["updated"]),
+        "skipped": len(result["skipped"]),
+        "createdCount": len(result["created"]),
+        "updatedCount": len(result["updated"]),
+        "candidate": selected[0],
+        "alternatives": candidates,
+    }, None, 200
 
 
 def _current_user_group_members(pgid):
@@ -2133,6 +3120,8 @@ def resolve_app_stop_target(app, listeners=None):
         return None, "受控进程组信息无效"
     legacy_pid = legacy_managed_pid(app, listeners)
     if legacy_pid:
+        if IS_WINDOWS:
+            return {"kind": "pid", "id": legacy_pid, "members": [legacy_pid]}, None
         if app.get("attached"):
             try:
                 pgid = os.getpgid(legacy_pid)
@@ -2156,8 +3145,11 @@ def resolve_app_stop_target(app, listeners=None):
                         "kind": "group",
                         "id": pgid,
                         "members": list(members),
-                    }, None
+                }, None
         return {"kind": "pid", "id": legacy_pid, "members": [legacy_pid]}, None
+    restart_pid = recovered_restart_pid(app, listeners)
+    if restart_pid:
+        return {"kind": "pid", "id": restart_pid, "members": [restart_pid]}, None
     return None, "无法确认受控进程，未执行停止"
 
 
@@ -2165,6 +3157,8 @@ def signal_app_stop(target, sig=signal.SIGTERM):
     """Signal a target returned by resolve_app_stop_target."""
     ident = target["id"]
     if target["kind"] == "group":
+        return stop_pid_tree(ident, sig)
+    if IS_WINDOWS:
         return stop_pid_tree(ident, sig)
     try:
         os.kill(ident, sig)
@@ -2179,6 +3173,8 @@ def signal_app_stop(target, sig=signal.SIGTERM):
 
 def stop_target_alive(target, expected_uid=None):
     if target["kind"] == "group":
+        if IS_WINDOWS:
+            return bool(_current_user_group_members(target["id"]))
         try:
             os.killpg(target["id"], 0)
             return True
@@ -2188,6 +3184,8 @@ def stop_target_alive(target, expected_uid=None):
             return True
         except OSError:
             return True
+    if IS_WINDOWS:
+        return pid_alive(target["id"])
     try:
         os.kill(target["id"], 0)
         if expected_uid is None:
@@ -2280,6 +3278,18 @@ def inspect_attach_process(cfg, app, pid):
     if pid in owners:
         return False, "该进程已由卡片「%s」管理" % owners[pid].get("name", ""), {"status": 409}
     actual_cwd = lsof_cwds({pid}).get(pid)
+    if IS_WINDOWS:
+        declared_cwd = app.get("cwd")
+        if not isinstance(declared_cwd, str) or not declared_cwd or not os.path.isdir(declared_cwd):
+            return False, "Windows 无法读取外部进程目录；请先选择该服务的项目文件夹并确认", {
+                "status": 422,
+            }
+        return True, None, {
+            "status": 200,
+            "cwd": declared_cwd,
+            "signature": process_signature(snap[pid]),
+            "requiresUserCwd": True,
+        }
     if not actual_cwd:
         return False, "无法读取进程工作目录，已取消认领", {"status": 409}
     return True, None, {"status": 200, "cwd": actual_cwd}
@@ -2295,6 +3305,7 @@ def attach_app_process(cfg, app_id, app, pid):
     if not ok:
         return False, error, identity
     actual_cwd = identity["cwd"]
+    signature = identity.get("signature")
     cwd_updated = False
     pid_conflict = False
 
@@ -2313,6 +3324,8 @@ def attach_app_process(cfg, app_id, app, pid):
         target["lastPgid"] = None
         target["runToken"] = None
         target["attached"] = True
+        target["attachSignature"] = signature
+        target["restartSignature"] = None
         target["lastExit"] = None
         try:
             same = (isinstance(target.get("cwd"), str) and target["cwd"]
@@ -2702,8 +3715,23 @@ def validate_app_fields(data, partial):
         fields["kind"] = data["kind"]
     elif not partial:
         fields["kind"] = "service"
+    if "autoOpen" in data:
+        if not isinstance(data["autoOpen"], bool):
+            return None, "autoOpen 必须是布尔值"
+        fields["autoOpen"] = data["autoOpen"]
+    elif not partial:
+        fields["autoOpen"] = False
+    if "projectKey" in data:
+        v = data["projectKey"]
+        if v is not None and (not isinstance(v, str) or not v.strip() or len(v.strip()) > 160):
+            return None, "projectKey 必须是非空字符串或 null"
+        fields["projectKey"] = v.strip() if isinstance(v, str) else None
+    elif not partial:
+        fields["projectKey"] = None
     if fields.get("kind") == "task":
         fields["port"] = None  # 批处理任务无端口语义
+        fields["projectKey"] = None
+        fields["autoOpen"] = False
     return fields, None
 
 
@@ -3116,6 +4144,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/project/detect":
                 self.handle_project_detect()
                 return
+            if path == "/api/integrations/codex/sync":
+                self.handle_codex_project_sync()
+                return
             if path == "/api/console/restart":
                 self.discard_body()
                 self.handle_console_restart()
@@ -3174,7 +4205,11 @@ class Handler(BaseHTTPRequestHandler):
         if what not in ("dir", "script"):
             self.send_err(400, "what 必须是 dir/script")
             return
-        path, canceled = pick_path(what)
+        try:
+            path, canceled = pick_path(what)
+        except PickPathError as e:
+            self.send_json({"ok": False, "error": str(e)}, 500)
+            return
         if canceled:  # 用户取消不是错误，前端静默
             self.send_json({"ok": True, "canceled": True})
         elif not path:
@@ -3193,6 +4228,18 @@ class Handler(BaseHTTPRequestHandler):
         result, err = detect_project(data.get("cwd"))
         if err:
             self.send_err(400, err)
+            return
+        self.send_json(result)
+
+    def handle_codex_project_sync(self):
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        result, error, status = sync_codex_project(
+            self.server.cfg, data.get("cwd"), data.get("candidateIndex"))
+        if error:
+            self.send_err(status, error)
             return
         self.send_json(result)
 
@@ -3339,6 +4386,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         snapshot = self.server.cfg.snapshot()
+        project_key = fields.pop("projectKey", None)
+        project, project_error = resolve_existing_project(snapshot, project_key)
+        if project_error:
+            self.send_err(422, project_error)
+            return
         new_id = secrets.token_hex(4)
         while find_app(snapshot, new_id):
             new_id = secrets.token_hex(4)
@@ -3348,7 +4400,11 @@ class Handler(BaseHTTPRequestHandler):
                "glyph": fields["glyph"], "kind": fields["kind"],
                "icon": None, "favicon": None, "lastPid": None,
                "lastPgid": None, "runToken": None,
-               "attached": False, "lastExit": None,
+               "attached": False, "attachSignature": None,
+               "restartSignature": None,
+               "autoOpen": fields["autoOpen"], "sync": None,
+               "project": project,
+               "lastExit": None,
                "createdAt": int(time.time())}
         cwd_updated = False
         if attach_pid is not None:
@@ -3371,6 +4427,8 @@ class Handler(BaseHTTPRequestHandler):
             app["cwd"] = actual_cwd
             app["lastPid"] = attach_pid
             app["attached"] = True
+            app["attachSignature"] = identity.get("signature")
+            app["restartSignature"] = None
 
         attach_conflict = [False]
 
@@ -3495,6 +4553,7 @@ class Handler(BaseHTTPRequestHandler):
             stop_pid_tree(pgid)
             self.send_json({"ok": False, "error": "应用已被删除，已取消启动"}, 409)
             return
+        open_when_ready = schedule_frontend_open(self.server.cfg, app, token)
         # 一次性任务的正常形态就是快速退出，不能沿用服务的启动探测逻辑把
         # `echo`、清缓存等成功任务误判成“启动失败”。退出线程会独立记录结果。
         if (app.get("kind") or "service") == "task":
@@ -3509,7 +4568,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False,
                             "error": startup_failure_message(app_id, code)}, 422)
             return
-        self.send_json({"ok": True, "pid": proc.pid})
+        self.send_json({"ok": True, "pid": proc.pid,
+                        "openWhenReady": open_when_ready})
 
     @serialized_app_operation
     def handle_app_stop(self, app_id):
@@ -3592,7 +4652,9 @@ class Handler(BaseHTTPRequestHandler):
             stop_pid_tree(pgid)
             self.send_err(409, "应用已被删除，已取消重启")
             return
-        self.send_json({"ok": True, "pid": proc.pid})
+        self.send_json({"ok": True, "pid": proc.pid,
+                        "openWhenReady": schedule_frontend_open(
+                            self.server.cfg, current, new_token)})
 
     @serialized_app_operation
     def handle_icon_upload(self, app_id):
@@ -3673,6 +4735,8 @@ class Handler(BaseHTTPRequestHandler):
             if not fields:
                 self.send_err(400, "没有可更新的字段")
                 return
+            project_key_marker = object()
+            project_key = fields.pop("projectKey", project_key_marker)
             lifecycle_fields = {"command", "cwd", "port", "kind"}
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
@@ -3696,12 +4760,25 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_err(409, stop_error)
                     return
 
+            project_error = [None]
+
             def op(c):
                 target = find_app(c, m.group(1))
+                if project_key is not project_key_marker:
+                    project, error = resolve_existing_project(c, project_key)
+                    if error:
+                        project_error[0] = error
+                        return None
+                    target["project"] = project
                 target.update(fields)
+                if lifecycle_changed:
+                    target["restartSignature"] = None
                 return dict(target)
 
             updated = self.server.cfg.update(op)
+            if project_error[0]:
+                self.send_err(422, project_error[0])
+                return
             if stopped_for_update:
                 updated = dict(updated)
                 updated["stoppedForUpdate"] = True
@@ -3926,10 +5003,14 @@ def launcher_main():
 
 def schedule_console_restart(server, preferred_port):
     """启动独立 helper，响应发出后关闭当前 HTTP 服务。"""
+    kwargs = {"cwd": BASE_DIR, "close_fds": True}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
     helper = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--restart-helper",
-         str(SELF_PID), str(int(preferred_port))],
-        cwd=BASE_DIR, start_new_session=True, close_fds=True)
+         str(SELF_PID), str(int(preferred_port))], **kwargs)
 
     def _shutdown():
         time.sleep(0.25)
@@ -3955,6 +5036,10 @@ def restart_helper(old_pid, preferred_port):
         return 1
     args = [sys.executable, os.path.abspath(__file__),
             "--preferred-port", str(int(preferred_port)), "--no-browser"]
+    if IS_WINDOWS:
+        subprocess.Popen(args, cwd=BASE_DIR,
+                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        return 0
     os.execv(sys.executable, args)
     return 0
 
@@ -4002,7 +5087,8 @@ def redirect_console_output():
     path = os.path.join(LOGS_DIR, "console.log")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        if not IS_WINDOWS:
+            os.fchmod(fd, 0o600)
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()

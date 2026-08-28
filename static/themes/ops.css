@@ -327,6 +327,55 @@ a.icon-btn { text-decoration: none; }
   gap: 14px;
 }
 
+.project-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 14px;
+}
+.project-group {
+  padding: 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+  border-radius: 13px;
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--accent) 5%, var(--card)), var(--card) 44%);
+}
+.project-group[hidden] { display: none; }
+.project-group.project-drop-target {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent), var(--shadow);
+}
+.project-group.project-drop-target .project-group-head { color: var(--accent); }
+.project-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 1px 2px 12px;
+}
+.project-group-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 750;
+}
+.project-group-title > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-group-title svg { color: var(--accent); flex: none; }
+.project-group-summary {
+  overflow: hidden;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-service-grid { grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); }
+
 .app-card {
   --glow: var(--accent);
   position: relative;
@@ -708,20 +757,22 @@ body.dragging-on { cursor: grabbing; user-select: none; -webkit-user-select: non
   font-size: 12.5px; font-weight: 700; color: var(--ink-2);
 }
 .req { color: var(--red); margin-left: 2px; }
-.field input, .field textarea {
+.field input, .field textarea, .field select {
   width: 100%; padding: 8px 12px;
   border: 1px solid var(--line-2); border-radius: 8px;
   background: var(--card); font-size: 13px;
   transition: border-color 0.13s ease, box-shadow 0.13s ease;
 }
 .field textarea { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; resize: vertical; min-height: 64px; }
-.field input:focus, .field textarea:focus { outline: none; border-color: var(--accent); box-shadow: var(--focus-ring); }
-.field input.invalid, .field textarea.invalid { border-color: var(--red); }
-.field input.invalid:focus, .field textarea.invalid:focus { box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--red) 30%, transparent); }
+.field input:focus, .field textarea:focus, .field select:focus { outline: none; border-color: var(--accent); box-shadow: var(--focus-ring); }
+.field input.invalid, .field textarea.invalid, .field select.invalid { border-color: var(--red); }
+.field input.invalid:focus, .field textarea.invalid:focus, .field select.invalid:focus { box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--red) 30%, transparent); }
 .field input::placeholder, .field textarea::placeholder { color: var(--ink-4); }
 .input-row { display: flex; gap: 8px; }
 .input-row input { flex: 1; }
 .input-row .btn { flex: none; height: 38px; }
+.attach-confirm { display: flex; align-items: flex-start; gap: 8px; margin-top: 9px; color: var(--ink-3); font-size: 11.5px; font-weight: 500; line-height: 1.55; }
+.attach-confirm input { width: 14px; height: 14px; margin: 2px 0 0; flex: none; accent-color: var(--accent); }
 .hint { margin: 8px 0 0; font-family: var(--font-mono); font-size: 10px; color: var(--ink-4); line-height: 1.55; }
 .link-btn { font-size: 12px; font-weight: 600; color: var(--accent); }
 .link-btn:hover:not(:disabled) { text-decoration: underline; text-underline-offset: 3px; }

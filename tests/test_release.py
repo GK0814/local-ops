@@ -57,6 +57,8 @@ class ReleaseFixtureTests(unittest.TestCase):
                 release.iter_release_files()
 
     def test_symlinked_required_source_is_rejected(self):
+        if os.name == "nt":
+            self.skipTest("creating symlinks requires Windows developer privileges")
         target = self.write("target/server.py")
         (self.root / "server.py").symlink_to(target)
         with mock.patch.object(release, "INCLUDE", ("server.py",)):
@@ -111,7 +113,8 @@ class ReleaseFixtureTests(unittest.TestCase):
             release.verify_archive(second, entries, "1.2.3")
 
         self.assertEqual(first.read_bytes(), second.read_bytes())
-        self.assertEqual(stat.S_IMODE(second.stat().st_mode), 0o644)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(second.stat().st_mode), 0o644)
         with zipfile.ZipFile(second) as archive:
             infos = {info.filename: info for info in archive.infolist()}
         regular_info = infos["总控台-1.2.3/server.py"]

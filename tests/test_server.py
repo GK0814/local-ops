@@ -32,7 +32,8 @@ node 101 user 1u IPv6 0x0 0t0 TCP [::1]:5173 (LISTEN)
 node 202 user 2u IPv4 0x0 0t0 TCP 127.0.0.1:8000 (LISTEN)
 node 303 user 3u IPv6 0x0 0t0 TCP *:3000 (LISTEN)
 """
-        with mock.patch.object(server, "run_cmd", return_value=output):
+        with mock.patch.object(server, "IS_WINDOWS", False), \
+                mock.patch.object(server, "run_cmd", return_value=output):
             listeners = server.scan_listeners()
 
         self.assertEqual(listeners[(101, 5173)], {"::1"})
@@ -42,6 +43,105 @@ node 303 user 3u IPv6 0x0 0t0 TCP *:3000 (LISTEN)
             server.listener_open_host(listeners, 8000, {202}), "127.0.0.1")
         self.assertEqual(
             server.listener_open_host(listeners, 3000, {303}), "127.0.0.1")
+
+    def test_windows_listener_scan_uses_netstat_and_preserves_bind_hosts(self):
+        output = """\
+  TCP    127.0.0.1:5173         0.0.0.0:0              LISTENING       101
+  TCP    [::1]:8000             [::]:0                 LISTENING       202
+  TCP    127.0.0.1:5173         127.0.0.1:6000         ESTABLISHED     101
+"""
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.object(server, "run_cmd", return_value=output) as run:
+            listeners = server.scan_listeners()
+
+        run.assert_called_once_with(["netstat.exe", "-ano", "-p", "tcp"])
+        self.assertEqual(listeners[(101, 5173)], {"127.0.0.1"})
+        self.assertEqual(listeners[(202, 8000)], {"::1"})
+        self.assertEqual(
+            server.listener_open_host(listeners, 8000, {202}), "localhost")
+
+    def test_windows_service_grouping_keeps_gui_apps_in_background(self):
+        with mock.patch.object(server, "IS_WINDOWS", True):
+            self.assertEqual(server.classify_group(
+                "Weixin.exe:14013", "Weixin.exe", r"C:\\Program Files\\WeChat\\Weixin.exe",
+                "", None, set()), "background")
+            self.assertEqual(server.classify_group(
+                "node.exe:5173", "node.exe", r"C:\\Program Files\\nodejs\\node.exe",
+                "node vite", None, set()), "mine")
+            self.assertEqual(server.classify_group(
+                "chrome.exe:9222", "chrome.exe", r"C:\\Program Files\\Google\\Chrome\\chrome.exe",
+                "", None, set(), managed=True), "mine")
+
+    def test_windows_process_snapshot_reports_memory_as_physical_percent(self):
+        records = [{"pid": 42, "uid": server.SELF_UID, "comm": "node.exe",
+                    "args": "node server.js", "cpuSeconds": 4.0,
+                    "mem": 12.5, "etime": 18, "ppid": 1}]
+        with mock.patch.object(server, "IS_WINDOWS", True), \
+                mock.patch.object(server, "run_cmd", return_value=json.dumps(records)), \
+                mock.patch.object(server, "WINDOWS_CPU_SAMPLES", {}):
+            snapshot = server.ps_snapshot({42})
+
+        self.assertEqual(snapshot[42]["mem"], 12.5)
+        self.assertEqual(snapshot[42]["cpu"], 0.0)
+
+
+class FrontendAutoOpenTests(unittest.TestCase):
+    def _config_with_frontend(self, directory):
+        path = os.path.join(directory, "config.json")
+        app = {**server.Config.APP_DEFAULT, "id": "deadbeef",
+               "name": "Frontend", "command": "npm run dev",
+               "cwd": directory, "port": 5173, "lastPid": 12,
+               "lastPgid": 12, "runToken": "run-token",
+               "sync": {"role": "frontend"}}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({**server.Config.DEFAULT, "apps": [app]}, f)
+        return server.Config(path)
+
+    def test_frontend_page_opens_only_after_its_port_is_owned(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config_with_frontend(td)
+            listeners = {(12, 5173): {"127.0.0.1"}}
+            with mock.patch.object(server, "managed_pids", return_value=[12]), \
+                    mock.patch.object(server, "scan_listeners", return_value=listeners), \
+                    mock.patch.object(server.webbrowser, "open", return_value=True) as open_page:
+                opened = server.open_frontend_when_ready(
+                    cfg, "deadbeef", "run-token", 5173, timeout=0)
+
+        self.assertTrue(opened)
+        open_page.assert_called_once_with("http://127.0.0.1:5173/", new=2)
+
+    def test_frontend_page_does_not_open_for_another_process_listener(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config_with_frontend(td)
+            listeners = {(99, 5173): {"127.0.0.1"}}
+            with mock.patch.object(server, "managed_pids", return_value=[12]), \
+                    mock.patch.object(server, "scan_listeners", return_value=listeners), \
+                    mock.patch.object(server.webbrowser, "open") as open_page:
+                opened = server.open_frontend_when_ready(
+                    cfg, "deadbeef", "run-token", 5173, timeout=0)
+
+        self.assertFalse(opened)
+        open_page.assert_not_called()
+
+    def test_frontend_without_configured_port_opens_its_owned_listener(self):
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config_with_frontend(td)
+            cfg.update(lambda data: data["apps"][0].update({"port": None}))
+            listeners = {(12, 8080): {"127.0.0.1"}}
+            with mock.patch.object(server, "managed_pids", return_value=[12]), \
+                    mock.patch.object(server, "scan_listeners", return_value=listeners), \
+                    mock.patch.object(server.webbrowser, "open", return_value=True) as open_page:
+                opened = server.open_frontend_when_ready(
+                    cfg, "deadbeef", "run-token", None, timeout=0)
+
+        self.assertTrue(opened)
+        open_page.assert_called_once_with("http://127.0.0.1:8080/", new=2)
+
+    def test_detected_frontend_flag_supports_custom_npm_script(self):
+        app = {"kind": "service", "port": 4173,
+               "command": "npm run preview-local", "autoOpen": True}
+
+        self.assertTrue(server.is_frontend_app(app))
 
 
 class OriginAttributionTests(unittest.TestCase):
@@ -128,6 +228,7 @@ class OriginAttributionTests(unittest.TestCase):
 
 
 class ScriptCommandTests(unittest.TestCase):
+    @unittest.skipIf(server.IS_WINDOWS, "POSIX shell command contract")
     def test_script_extensions_choose_the_expected_runtime_and_quote_paths(self):
         cases = {
             ".py": "python3",
@@ -144,6 +245,7 @@ class ScriptCommandTests(unittest.TestCase):
                     parts = shlex.split(server.command_for_script(path))
                     self.assertEqual(parts, [runner, "--", path])
 
+    @unittest.skipIf(server.IS_WINDOWS, "POSIX executable-bit contract")
     def test_executable_command_is_invoked_directly(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "nightly job.command")
@@ -153,6 +255,7 @@ class ScriptCommandTests(unittest.TestCase):
             self.assertEqual(
                 shlex.split(server.command_for_script(path)), [path])
 
+    @unittest.skipIf(server.IS_WINDOWS, "POSIX shell command contract")
     def test_non_executable_command_uses_bash(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "nightly job.command")
@@ -165,6 +268,16 @@ class ScriptCommandTests(unittest.TestCase):
 
 
 class AppHealthTests(unittest.TestCase):
+    def test_windows_powershell_script_with_quoted_path_is_checked(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "job's file.ps1")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("Write-Output ok\n")
+            with mock.patch.object(server, "IS_WINDOWS", True):
+                health = server.inspect_app_health({
+                    "command": server.command_for_script(path), "cwd": td})
+        self.assertFalse(health["blocking"])
+
     def test_python_script_with_spaces_is_checked_without_running_it(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "daily task.py")
@@ -180,6 +293,7 @@ class AppHealthTests(unittest.TestCase):
         self.assertEqual(health["issues"][0]["kind"], "script-missing")
         self.assertEqual(health["issues"][0]["action"], "pick-script")
 
+    @unittest.skipIf(server.IS_WINDOWS, "POSIX shell command contract")
     def test_relative_script_uses_configured_working_directory(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "job.sh")
@@ -188,6 +302,7 @@ class AppHealthTests(unittest.TestCase):
             app = {"command": "/bin/bash -- job.sh", "cwd": td}
             self.assertFalse(server.inspect_app_health(app)["blocking"])
 
+    @unittest.skipIf(server.IS_WINDOWS, "POSIX shell command contract")
     def test_missing_cwd_does_not_cascade_for_relative_script(self):
         with tempfile.TemporaryDirectory() as td:
             missing = os.path.join(td, "gone")
@@ -196,6 +311,7 @@ class AppHealthTests(unittest.TestCase):
         self.assertEqual([item["kind"] for item in health["issues"]],
                          ["cwd-missing"])
 
+    @unittest.skipIf(server.IS_WINDOWS, "POSIX shell command contract")
     def test_complex_or_dynamic_command_is_unknown_and_not_blocked(self):
         for command in ("python3 job.py && echo done", "python3 '$JOB'",
                         "python3 'unterminated"):
@@ -218,6 +334,7 @@ class AppHealthTests(unittest.TestCase):
                 {"command": "definitely-not-installed --version", "cwd": None})
         self.assertEqual(health["issues"][0]["kind"], "runtime-missing")
 
+    @unittest.skipIf(server.IS_WINDOWS, "POSIX executable-bit contract")
     def test_direct_script_requires_execute_permission_but_bash_script_does_not(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "job.command")
@@ -231,6 +348,7 @@ class AppHealthTests(unittest.TestCase):
         self.assertEqual(direct["issues"][0]["kind"], "script-not-executable")
         self.assertFalse(wrapped["blocking"])
 
+    @unittest.skipIf(server.IS_WINDOWS, "creating symlinks requires Windows developer privileges")
     def test_broken_script_symlink_is_unavailable(self):
         with tempfile.TemporaryDirectory() as td:
             link = os.path.join(td, "job.py")
@@ -239,6 +357,7 @@ class AppHealthTests(unittest.TestCase):
                 {"command": server.command_for_script(link), "cwd": td})
         self.assertEqual(health["issues"][0]["kind"], "script-missing")
 
+    @unittest.skipIf(server.IS_WINDOWS, "POSIX python3 shell wrapper contract")
     def test_task_cancel_exit_code_survives_shell_wrapper(self):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch.object(server, "LOGS_DIR", td):
@@ -248,8 +367,34 @@ class AppHealthTests(unittest.TestCase):
             self.assertTrue(ok, error)
             self.assertEqual(proc.wait(timeout=3), 130)
 
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows python3 compatibility path")
+    def test_windows_python3_command_falls_back_to_python(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "LOGS_DIR", td), \
+                mock.patch.object(server, "windows_command_exists",
+                                  side_effect=lambda name: name == "python"):
+            app = {"id": "deadbeef", "cwd": td,
+                   "command": "python3 -c \"raise SystemExit(130)\""}
+            ok, error, proc, _, _ = server.start_app(app)
+            self.assertTrue(ok, error)
+            self.assertEqual(proc.wait(timeout=5), 130)
+
 
 class ProjectDetectionTests(unittest.TestCase):
+    def test_windows_prefers_powershell_start_script(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "start.ps1"), "w", encoding="utf-8") as f:
+                f.write("Write-Output ready\n")
+            with open(os.path.join(td, "start.bat"), "w", encoding="utf-8") as f:
+                f.write("@echo ready\n")
+            with mock.patch.object(server, "IS_WINDOWS", True):
+                result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        self.assertEqual(result["files"], ["start.ps1"])
+        self.assertEqual(result["candidates"][0]["source"], "start.ps1")
+        self.assertTrue(result["candidates"][0]["command"].startswith("& '"))
+
     def test_package_json_uses_lockfile_runner_and_framework_port(self):
         with tempfile.TemporaryDirectory() as td:
             with open(os.path.join(td, "package.json"), "w", encoding="utf-8") as f:
@@ -300,11 +445,12 @@ class ProjectDetectionTests(unittest.TestCase):
             static, static_error = server.detect_project(static_dir)
 
         self.assertIsNone(django_error)
-        self.assertEqual(django["candidates"][0]["command"], "python3 manage.py runserver")
+        python_command = "python" if server.IS_WINDOWS else "python3"
+        self.assertEqual(django["candidates"][0]["command"], python_command + " manage.py runserver")
         self.assertEqual(django["candidates"][0]["port"], 8000)
         self.assertIsNone(static_error)
         self.assertEqual(static["candidates"][0]["command"],
-                         "python3 -m http.server 8000")
+                         python_command + " -m http.server 8000")
 
     def test_invalid_folder_returns_a_clear_error(self):
         result, error = server.detect_project("/path/that/does/not/exist")
@@ -320,6 +466,28 @@ class ProjectDetectionTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(result["candidates"], [])
 
+    def test_detects_qt_desktop_application_without_a_port(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "app.py"), "w", encoding="utf-8") as f:
+                f.write("from PySide6.QtWidgets import QApplication\n")
+            venv_dir = os.path.join(
+                td, ".venv", "Scripts" if server.IS_WINDOWS else "bin")
+            os.makedirs(venv_dir)
+            executable = os.path.join(
+                venv_dir, "python.exe" if server.IS_WINDOWS else "python")
+            with open(executable, "w", encoding="utf-8") as f:
+                f.write("")
+
+            result, error = server.detect_project(td)
+
+        self.assertIsNone(error)
+        candidate = result["candidates"][0]
+        self.assertEqual(candidate["label"], "Qt 桌面应用")
+        self.assertEqual(candidate["kind"], "service")
+        self.assertIsNone(candidate["port"])
+        self.assertEqual(candidate["role"], "desktop")
+        self.assertIn(".venv", candidate["command"])
+
     def test_hexo_structure_needs_no_package_script(self):
         with tempfile.TemporaryDirectory() as td:
             with open(os.path.join(td, "_config.yml"), "w", encoding="utf-8") as f:
@@ -330,7 +498,9 @@ class ProjectDetectionTests(unittest.TestCase):
             result, error = server.detect_project(td)
 
         self.assertIsNone(error)
-        self.assertEqual(result["candidates"], [
+        self.assertEqual([{key: item[key] for key in
+                           ("command", "label", "source", "port", "kind", "detail")}
+                          for item in result["candidates"]], [
             {"command": "hexo s", "label": "Hexo 本地服务",
              "source": "Hexo 项目结构", "port": 4000,
              "kind": "service", "detail": "等同于 hexo server"},
@@ -338,6 +508,8 @@ class ProjectDetectionTests(unittest.TestCase):
              "source": "Hexo 项目结构", "port": None,
              "kind": "task", "detail": "清除缓存和已生成文件，不启动服务"},
         ])
+        self.assertEqual(result["candidates"][0]["role"], "frontend")
+        self.assertEqual(result["candidates"][0]["cwd"], os.path.normcase(os.path.realpath(td)))
 
     def test_hexo_server_script_is_not_duplicated(self):
         with tempfile.TemporaryDirectory() as td:
@@ -350,6 +522,30 @@ class ProjectDetectionTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual([item["command"] for item in result["candidates"]],
                          ["hexo s", "hexo cl"])
+
+    def test_detects_one_level_frontend_and_backend_services(self):
+        with tempfile.TemporaryDirectory() as root:
+            frontend = os.path.join(root, "frontend")
+            backend = os.path.join(root, "backend")
+            os.mkdir(frontend)
+            os.mkdir(backend)
+            with open(os.path.join(frontend, "package.json"), "w", encoding="utf-8") as f:
+                json.dump({"scripts": {"dev": "vite --host"},
+                           "devDependencies": {"vite": "latest"}}, f)
+            with open(os.path.join(backend, "main.py"), "w", encoding="utf-8") as f:
+                f.write("from fastapi import FastAPI\napp = FastAPI()\n")
+
+            result, error = server.detect_project(root)
+
+        self.assertIsNone(error)
+        self.assertEqual([(item["role"], item["port"]) for item in result["candidates"]],
+                         [("frontend", 5173), ("backend", 8000)])
+        self.assertEqual(result["candidates"][0]["cwd"],
+                         os.path.normcase(os.path.realpath(frontend)))
+        self.assertEqual(result["candidates"][1]["cwd"],
+                         os.path.normcase(os.path.realpath(backend)))
+        self.assertNotEqual(result["candidates"][0]["serviceKey"],
+                            result["candidates"][1]["serviceKey"])
 
 
 class ConfigTests(unittest.TestCase):
@@ -374,9 +570,10 @@ class ConfigTests(unittest.TestCase):
                 backup = json.load(f)
             self.assertEqual(current["watchedKeywords"], ["node", "ffmpeg"])
             self.assertEqual(backup["watchedKeywords"], ["node"])
-            self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
-            self.assertEqual(oct(os.stat(path + ".bak").st_mode & 0o777),
-                             "0o600")
+            if not server.IS_WINDOWS:
+                self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+                self.assertEqual(oct(os.stat(path + ".bak").st_mode & 0o777),
+                                 "0o600")
 
     def test_load_falls_back_to_backup(self):
         with tempfile.TemporaryDirectory() as td:
@@ -443,6 +640,19 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(json.load(f), previous_backup)
 
 
+class CommandRunnerTests(unittest.TestCase):
+    def test_timeout_kills_runner_without_waiting_for_inherited_pipes(self):
+        proc = mock.Mock()
+        proc.communicate.side_effect = subprocess.TimeoutExpired(["slow"], 1)
+        proc.stdout = mock.Mock()
+        proc.stderr = mock.Mock()
+        with mock.patch.object(server.subprocess, "Popen", return_value=proc):
+            self.assertEqual(server.run_cmd(["slow"], timeout=1), "")
+        proc.kill.assert_called_once()
+        proc.stdout.close.assert_called_once()
+        proc.stderr.close.assert_called_once()
+
+
 class RuntimeStorageTests(unittest.TestCase):
     def test_runtime_override_requires_a_dedicated_absolute_directory(self):
         with mock.patch.dict(os.environ, {"TEST_CONSOLE_DIR": ""}):
@@ -483,10 +693,11 @@ class RuntimeStorageTests(unittest.TestCase):
             with open(os.path.join(logs, "deadbeef.log"), "rb") as f:
                 self.assertEqual(f.read(), b"log")
             self.assertTrue(os.path.isfile(os.path.join(legacy, "config.json")))
-            self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
-            self.assertEqual(
-                oct(os.stat(os.path.join(target, "config.json")).st_mode & 0o777),
-                "0o600")
+            if not server.IS_WINDOWS:
+                self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o700")
+                self.assertEqual(
+                    oct(os.stat(os.path.join(target, "config.json")).st_mode & 0o777),
+                    "0o600")
 
             # 已存在的目标绝不被旧项目目录二次覆盖。
             with open(os.path.join(legacy, "config.json"), "w",
@@ -572,8 +783,9 @@ class RuntimeStorageTests(unittest.TestCase):
             self.assertEqual(result.stdout, "")
             log_path = os.path.join(logs, "console.log")
             with open(log_path, encoding="utf-8") as f:
-                self.assertEqual(f.read(), "launcher-log-ready\n")
-            self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
+                self.assertEqual(f.read().splitlines()[0], "launcher-log-ready")
+            if not server.IS_WINDOWS:
+                self.assertEqual(os.stat(log_path).st_mode & 0o777, 0o600)
 
 
 class ProcessIdentityTests(unittest.TestCase):
@@ -621,13 +833,18 @@ class ProcessIdentityTests(unittest.TestCase):
                "runToken": None, "port": 8080, "cwd": "/tmp/project"}
         with mock.patch.object(server, "managed_pids", return_value=[]), \
                 mock.patch.object(server, "legacy_managed_pid", return_value=999), \
-                mock.patch.object(server.os, "kill") as stop:
+                mock.patch.object(server.os, "kill") as stop, \
+                mock.patch.object(server, "stop_pid_tree", return_value=(True, None)) as stop_tree:
             target, error = server.resolve_app_stop_target(
                 app, {(999, 8080)})
             self.assertIsNone(error)
             stopped, error = server.signal_app_stop(target)
             self.assertTrue(stopped, error)
-        stop.assert_called_once_with(999, signal.SIGTERM)
+        if server.IS_WINDOWS:
+            stop_tree.assert_called_once_with(999, signal.SIGTERM)
+            stop.assert_not_called()
+        else:
+            stop.assert_called_once_with(999, signal.SIGTERM)
 
     def test_running_app_can_be_stopped_in_place_before_update(self):
         cfg = mock.Mock()
@@ -652,6 +869,7 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertFalse(stopped)
         stop.assert_not_called()
 
+    @unittest.skipIf(server.IS_WINDOWS, "Windows attachment deliberately pins PID and command signature")
     def test_attach_claims_current_user_listener_via_legacy_identity(self):
         stored = {"apps": [{"id": "a", "port": 8080, "cwd": "/old",
                             "kind": "service"}]}
@@ -679,6 +897,7 @@ class ProcessIdentityTests(unittest.TestCase):
         self.assertEqual(target["cwd"], "/new")
         self.assertTrue(info["cwdUpdated"])
 
+    @unittest.skipIf(server.IS_WINDOWS, "Windows cannot verify an external child process working directory")
     def test_attached_listener_survives_child_pid_rotation_by_unique_cwd(self):
         app = {"id": "a", "port": 3000, "cwd": "/project",
                "kind": "service", "lastPid": 4242, "attached": True}
@@ -693,6 +912,7 @@ class ProcessIdentityTests(unittest.TestCase):
         )
         self.assertEqual(pid, 5252)
 
+    @unittest.skipIf(server.IS_WINDOWS, "Windows cannot verify an external child process working directory")
     def test_attached_listener_requires_a_unique_uid_cwd_match(self):
         app = {"id": "a", "port": 3000, "cwd": "/project",
                "kind": "service", "lastPid": 4242, "attached": True}
@@ -722,7 +942,7 @@ class ProcessIdentityTests(unittest.TestCase):
                 mock.patch.object(server, "scan_listeners",
                                   return_value={(4242, 8080)}), \
                 mock.patch.object(server, "ps_snapshot",
-                                  return_value={4242: {"uid": server.SELF_UID + 1}}):
+                return_value={4242: {"uid": ("other-user" if server.IS_WINDOWS else server.SELF_UID + 1)}}):
             ok, error, _ = server.attach_app_process(cfg, "a", app, 4242)
         self.assertFalse(ok)
         self.assertIn("不属于当前用户", error)
@@ -814,7 +1034,9 @@ class LaunchEnvironmentTests(unittest.TestCase):
             env = server.build_launch_env("secret", {"PATH": "/usr/bin:/bin"})
 
         paths = env["PATH"].split(os.pathsep)
-        self.assertIn("/Users/example/.local/bin", paths)
+        expected_local_bin = (r"/Users/example\.local\bin"
+                              if server.IS_WINDOWS else "/Users/example/.local/bin")
+        self.assertIn(expected_local_bin, paths)
         self.assertIn("/usr/local/bin", paths)
         self.assertIn("/opt/homebrew/bin", paths)
         self.assertIn("/Users/example/.nvm/versions/node/v22/bin", paths)
@@ -833,6 +1055,174 @@ class LaunchEnvironmentTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows process sampling only")
+    def test_windows_state_samples_only_managed_roots_and_listeners(self):
+        app = {**server.Config.APP_DEFAULT, "id": "managed",
+               "lastPid": 101, "lastPgid": 101, "runToken": "token"}
+        listeners = {(202, 5173)}
+        snapshot = {
+            101: {"uid": server.SELF_UID, "ppid": 0, "args": "console-run:token"},
+            202: {"uid": server.SELF_UID, "ppid": 101, "args": "node vite"},
+        }
+        with mock.patch.object(server, "scan_listeners", return_value=listeners), \
+                mock.patch.object(server, "windows_process_tree_snapshot",
+                                  return_value=snapshot) as targeted, \
+                mock.patch.object(server, "build_services",
+                                  return_value=([], listeners)), \
+                mock.patch.object(server, "build_watched", return_value=[]), \
+                mock.patch.object(server, "build_apps", return_value=[]):
+            state = server.build_state({"apps": [app], "watchedKeywords": []}, 9600)
+
+        targeted.assert_called_once_with({101}, {202})
+        self.assertEqual(state["services"], [])
+
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows process sampling only")
+    def test_windows_targeted_snapshot_uses_batched_wmi_queries(self):
+        captured = []
+        with mock.patch.object(server, "run_cmd", side_effect=lambda args: captured.append(args) or "[]"):
+            self.assertEqual(server.windows_process_tree_snapshot({101}, {202, 303}), {})
+
+        script = captured[0][-1]
+        self.assertIn("$roots=@(101)", script)
+        self.assertIn("$wanted=@(101,202,303)", script)
+        self.assertIn("ParentProcessId", script)
+        self.assertNotIn("foreach($id in $frontier){if($seen", script)
+
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows process grouping only")
+    def test_windows_process_grouping_skips_cyclic_parent_links(self):
+        groups = server.pgid_members_map({
+            101: {"ppid": 202},
+            202: {"ppid": 101},
+        })
+        self.assertEqual(set(groups[101]), {101, 202})
+        self.assertEqual(set(groups[202]), {101, 202})
+
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows external-process attachment only")
+    def test_windows_attached_process_requires_same_pid_port_user_and_signature(self):
+        app = {**server.Config.APP_DEFAULT, "id": "windows-attached",
+               "name": "Windows attached", "command": "node src/server.js",
+               "cwd": "C:\\workspace", "port": 8080, "lastPid": 999,
+               "attached": True}
+        process = {"uid": server.SELF_UID, "comm": "node.exe",
+                   "args": "node src/server.js", "etime": 42}
+        app["attachSignature"] = server.process_signature(process)
+        with mock.patch.object(server, "ps_snapshot", return_value={999: process}):
+            self.assertEqual(server.legacy_managed_pid(app, {(999, 8080)}), 999)
+        process["args"] = "node another-service.js"
+        with mock.patch.object(server, "ps_snapshot", return_value={999: process}):
+            self.assertIsNone(server.legacy_managed_pid(app, {(999, 8080)}))
+
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows restart recovery only")
+    def test_windows_project_external_restart_recovers_unique_matching_listener(self):
+        process = {"uid": server.SELF_UID, "comm": "node.exe",
+                   "args": "node D:\\project\\node_modules\\vite\\bin\\vite.js",
+                   "cpu": 0.1, "mem": 0.2, "etime": 42}
+        app = {**server.Config.APP_DEFAULT, "id": "project-app",
+               "name": "项目", "command": "npm run dev",
+               "cwd": "D:\\project", "port": 5173,
+               "runToken": "old-console-token",
+               "project": {"key": "codex:project", "name": "项目",
+                           "cwd": "D:\\project"},
+               "restartSignature": server.process_signature(process)}
+        listeners = {(5252, 5173)}
+        self.assertEqual(server.recovered_restart_pid(
+            app, listeners, {5252: process}), 5252)
+
+        with mock.patch.object(
+                server, "managed_process_index", return_value=({"project-app": []}, {}, {})), \
+                mock.patch.object(server, "lsof_cwds", return_value={}):
+            row = server.build_apps({"apps": [app]}, listeners,
+                                    process_snapshot={5252: process})[0]
+        self.assertTrue(row["running"])
+        self.assertTrue(row["listening"])
+        self.assertTrue(row["recoveredExternal"])
+        self.assertFalse(row["portOccupied"])
+
+        with mock.patch.object(
+                server, "managed_process_index", return_value=({"project-app": []}, {}, {})), \
+                mock.patch.object(server, "lsof_cwds", return_value={}):
+            service = server.build_services({"apps": [app]}, listeners=listeners,
+                                            process_snapshot={5252: process})[0][0]
+        self.assertEqual(service["appId"], "project-app")
+
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows restart recovery only")
+    def test_windows_codex_restart_accepts_workspace_evidence_not_exact_command(self):
+        old_listener = {"uid": server.SELF_UID, "comm": "node.exe",
+                        "args": "node D:\\project\\web\\node_modules\\vite\\bin\\vite.js"}
+        restarted_listener = {"uid": server.SELF_UID, "comm": "node.exe",
+                              "args": "node --inspect D:\\project\\web\\node_modules\\vite\\bin\\vite.js --host"}
+        app = {**server.Config.APP_DEFAULT, "id": "project-app",
+               "command": "npm run dev", "cwd": "D:\\project\\web",
+               "port": 5173,
+               "project": {"key": "codex:project", "name": "项目",
+                           "cwd": "D:\\project"},
+               "sync": {"origin": "codex", "projectKey": "codex:project"},
+               "restartSignature": server.process_signature(old_listener)}
+        self.assertNotEqual(server.process_signature(old_listener),
+                            server.process_signature(restarted_listener))
+        self.assertEqual(server.recovered_restart_pid(
+            app, {(5252, 5173)}, {5252: restarted_listener}), 5252)
+
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows restart recovery only")
+    def test_windows_codex_restart_rejects_different_workspace_on_same_port(self):
+        listener = {"uid": server.SELF_UID, "comm": "node.exe",
+                    "args": "node D:\\project-other\\web\\node_modules\\vite\\bin\\vite.js"}
+        app = {**server.Config.APP_DEFAULT, "id": "project-app",
+               "command": "npm run dev", "cwd": "D:\\project\\web",
+               "port": 5173,
+               "project": {"key": "codex:project", "name": "项目",
+                           "cwd": "D:\\project"},
+               "sync": {"origin": "codex", "projectKey": "codex:project"}}
+        self.assertIsNone(server.recovered_restart_pid(
+            app, {(5252, 5173)}, {5252: listener}))
+
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows restart recovery only")
+    def test_windows_restart_recovery_rejects_unproven_or_ambiguous_listener(self):
+        process = {"uid": server.SELF_UID, "comm": "node.exe",
+                   "args": "node vite", "cpu": 0.1, "mem": 0.2,
+                   "etime": 42}
+        app = {**server.Config.APP_DEFAULT, "id": "project-app",
+               "name": "项目", "command": "npm run dev", "port": 5173,
+               "project": {"key": "codex:project", "name": "项目",
+                           "cwd": "D:\\project"},
+               "restartSignature": server.process_signature(process)}
+        self.assertIsNone(server.recovered_restart_pid(
+            app, {(5252, 5173), (6262, 5173)},
+            {5252: process, 6262: process}))
+        app["restartSignature"] = "not-the-listener"
+        self.assertIsNone(server.recovered_restart_pid(
+            app, {(5252, 5173)}, {5252: process}))
+        app["restartSignature"] = server.process_signature(process)
+        app["project"] = None
+        self.assertIsNone(server.recovered_restart_pid(
+            app, {(5252, 5173)}, {5252: process}))
+
+    @unittest.skipUnless(server.IS_WINDOWS, "Windows restart recovery only")
+    def test_windows_restart_signature_is_captured_from_managed_listener(self):
+        process = {"uid": server.SELF_UID, "comm": "node.exe",
+                   "args": "node vite", "cpu": 0.1, "mem": 0.2,
+                   "etime": 42}
+        app = {**server.Config.APP_DEFAULT, "id": "project-app",
+               "name": "项目", "command": "npm run dev", "port": 5173,
+               "runToken": "console-token",
+               "project": {"key": "codex:project", "name": "项目",
+                           "cwd": "D:\\project"}}
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({**server.Config.DEFAULT, "apps": [app]}, f)
+            cfg = server.Config(path)
+            with mock.patch.object(server, "scan_listeners",
+                                   return_value={(5252, 5173)}), \
+                    mock.patch.object(server, "managed_pids", return_value=[5252]), \
+                    mock.patch.object(server, "ps_snapshot",
+                                      return_value={5252: process}):
+                self.assertTrue(server.capture_restart_signature_when_ready(
+                    cfg, "project-app", "console-token", timeout=0))
+            stored = server.find_app(cfg.snapshot(), "project-app")
+        self.assertEqual(stored["restartSignature"],
+                         server.process_signature(process))
+
     def test_app_and_service_expose_ipv6_aware_open_host(self):
         app = {**server.Config.APP_DEFAULT, "id": "vite", "name": "公众号排版",
                "command": "npm run dev", "cwd": "/tmp/vite", "port": 5173}
@@ -970,7 +1360,7 @@ class StateTests(unittest.TestCase):
             10: {"uid": server.SELF_UID, "comm": "ffmpeg",
                  "args": "ffmpeg -i render-worker.mov",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
-            11: {"uid": server.SELF_UID + 1, "comm": "ffmpeg", "args": "ffmpeg -i b",
+            11: {"uid": ("other-user" if server.IS_WINDOWS else server.SELF_UID + 1), "comm": "ffmpeg", "args": "ffmpeg -i b",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
         }
         with mock.patch.object(server, "ps_snapshot", return_value=snap):
@@ -1044,7 +1434,7 @@ class ConsoleRestartTests(unittest.TestCase):
                     "etime": 10},
             71002: {"uid": server.SELF_UID, "args": "python3 server.py",
                     "etime": 20},
-            71003: {"uid": server.SELF_UID + 1, "args": "python3 server.py",
+            71003: {"uid": ("other-user" if server.IS_WINDOWS else server.SELF_UID + 1), "args": "python3 server.py",
                     "etime": 30},
             71004: {"uid": server.SELF_UID, "args": "python3 server.py --launcher",
                     "etime": 40},

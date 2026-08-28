@@ -26,6 +26,7 @@ function findSvc(key) {
     .find(s => serviceKey(s) === key);
 }
 function findWatch(key) { return ((state.data && state.data.watched) || []).find(w => String(w.pid) === key); }
+function fmtMemPct(value) { return fmtPct(value); }
 
 /* ---------------- 本页会话内的新端口发现 ----------------
    seenKeys 故意不写入 localStorage：刷新页面后以当时的真实监听状态重新建立
@@ -351,7 +352,7 @@ function updateServiceRow(row, svc) {
   setText(r.cwd, full ? truncateMiddle(shortHome(full)) : '');
   r.cwd.title = full;
   setText(r.ldCpu, fmtPct(svc.cpu));
-  setText(r.ldMem, fmtPct(svc.mem));
+  setText(r.ldMem, fmtMemPct(svc.mem));
   setText(r.up, fmtUptime(svc.uptimeSec));
   if (r.pin) {
     if (r._pinned !== !!svc.pinned) {
@@ -498,7 +499,7 @@ function updateWatchRow(row, w) {
   setText(r.kw, w.keyword || '');
   setText(r.pid, String(w.pid));
   setText(r.ldCpu, fmtPct(w.cpu));
-  setText(r.ldMem, fmtPct(w.mem));
+  setText(r.ldMem, fmtMemPct(w.mem));
   setText(r.up, fmtUptime(w.uptimeSec));
   const target = w.name || ('PID ' + w.pid);
   r.kill.title = '结束进程：' + target;

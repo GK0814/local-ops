@@ -4,11 +4,13 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
-  GLYPHS, findApp, bumpMutationEpoch } from './core.js';
+  GLYPHS, findApp, bumpMutationEpoch, PICKER_REQUEST_TIMEOUT_MS, state } from './core.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
 const fName = $('#fName'), fCmd = $('#fCmd'), fCwd = $('#fCwd'), fPort = $('#fPort');
+const projectField = $('#projectField'), fProject = $('#fProject');
+const attachConfirmRow = $('#attachConfirmRow'), attachConfirm = $('#attachConfirm');
 const kindRow = $('#kindRow'), portField = $('#portField'), fCmdLabel = $('#fCmdLabel');
 const btnPickScript = $('#btnPickScript'), btnPickCwd = $('#btnPickCwd');
 const btnDetectProject = $('#btnDetectProject');
@@ -43,6 +45,8 @@ function shellQuotePath(path) {
 function fallbackScriptCommand(path) {
   const quoted = shellQuotePath(path);
   const suffix = (String(path).match(/(\.[^./]+)$/) || [])[1]?.toLowerCase();
+  if (suffix === '.ps1' || suffix === '.psm1') return '& ' + quoted;
+  if (suffix === '.bat' || suffix === '.cmd') return 'cmd.exe /d /c ' + quoted;
   if (suffix === '.py') return 'python3 -- ' + quoted;
   if (suffix === '.zsh') return '/bin/zsh -- ' + quoted;
   return '/bin/bash -- ' + quoted;
@@ -177,6 +181,7 @@ function renderIconPreview() {
 let modalKind = 'service';
 let detectRequestSeq = 0;
 let detectedPortValue = null;
+let detectedAutoOpen = null;
 
 function readPortValue() {
   const raw = fPort.value.trim();
@@ -192,6 +197,7 @@ function resetDetection(clearAutoPort = false) {
   if (clearAutoPort && detectedPortValue != null &&
       fPort.value.trim() === String(detectedPortValue)) fPort.value = '';
   detectedPortValue = null;
+  detectedAutoOpen = null;
   btnDetectProject.disabled = false;
   btnPickCwd.disabled = false;
   detectPanel.hidden = true;
@@ -229,9 +235,12 @@ function refreshEditSaveMode() {
   const willAttach = !editingAppId && pendingAttach && modalKind === 'service'
     && readPortValue() === pendingAttach.port;
   setText(appSave, willAttach ? '保存并认领' : '保存');
-  appSave.disabled = appSaving || needsStop || (willAttach && detectingProject);
+  appSave.disabled = appSaving || needsStop || (willAttach && (
+    detectingProject || !fCwd.value.trim() || !attachConfirm.checked));
   appSave.title = needsStop ? '请先在当前面板' + stopVerb
-    : (willAttach && detectingProject ? '正在识别可靠的项目启动命令' : '');
+    : (willAttach && detectingProject ? '正在识别可靠的项目启动命令'
+      : willAttach && !fCwd.value.trim() ? '请先选择该服务的项目文件夹'
+        : willAttach && !attachConfirm.checked ? '请确认工作目录属于该服务' : '');
 }
 
 function setModalKind(kind) {
@@ -243,6 +252,9 @@ function setModalKind(kind) {
   });
   portField.hidden = modalKind === 'task';
   fPort.disabled = modalKind === 'task';
+  projectField.hidden = modalKind === 'task';
+  fProject.disabled = modalKind === 'task';
+  if (modalKind === 'task') fProject.value = '';
   setText(fCmdLabel, modalKind === 'task' ? '执行命令' : '启动命令');
   fName.placeholder = modalKind === 'task' ? '如：每日备份' : '如：本地博客';
   fCmd.placeholder = modalKind === 'task'
@@ -254,6 +266,44 @@ function setModalKind(kind) {
 }
 kindRow.querySelectorAll('.kind-btn').forEach(b =>
   b.addEventListener('click', () => setModalKind(b.dataset.kind)));
+
+function appProject(app) {
+  if (app && app.project && app.project.key) return app.project;
+  const sync = app && app.sync;
+  if (sync && sync.origin === 'codex') {
+    const key = sync.projectKey || sync.key;
+    if (key) return {
+      key,
+      name: sync.projectName || app.name || '未命名项目',
+      cwd: sync.projectPath || app.cwd || '',
+    };
+  }
+  return null;
+}
+
+function populateProjectChoices(app) {
+  const selected = (appProject(app) || {}).key || '';
+  const projects = new Map();
+  for (const candidate of ((state.data && state.data.apps) || [])) {
+    const project = appProject(candidate);
+    if (project && !projects.has(project.key)) projects.set(project.key, project);
+  }
+  const current = appProject(app);
+  if (current && !projects.has(current.key)) projects.set(current.key, current);
+  fProject.replaceChildren();
+  const detached = el('option');
+  detached.value = '';
+  detached.textContent = '不加入项目（独立服务）';
+  fProject.appendChild(detached);
+  for (const project of [...projects.values()].sort((left, right) =>
+    String(left.name).localeCompare(String(right.name), 'zh-Hans-CN'))) {
+    const option = el('option');
+    option.value = project.key;
+    option.textContent = project.name + (project.cwd ? ' · ' + project.cwd : '');
+    fProject.appendChild(option);
+  }
+  fProject.value = selected;
+}
 
 export function openAppModal(app, presetKind, focusAction = '') {
   editingAppId = app ? app.id : null;
@@ -269,17 +319,22 @@ export function openAppModal(app, presetKind, focusAction = '') {
   editingAppOriginal = app ? {
     command: app.command || '', cwd: app.cwd || null,
     port: app.port == null ? null : app.port,
-    kind: app.kind || 'service', running: !!app.running,
+    kind: app.kind || 'service', autoOpen: !!app.autoOpen,
+    running: !!app.running,
   } : null;
   resetDetection();
+  if (app) detectedAutoOpen = !!app.autoOpen;
   clearPendingIcon();
   removeStoredIcon = false;
   selectedGlyph = (app && app.glyph) || null;
   fName.value = (app && app.name) || '';
   fCmd.value = (app && app.command) || '';
   fCwd.value = (app && app.cwd) || '';
+  populateProjectChoices(app);
+  attachConfirm.checked = false;
+  attachConfirmRow.hidden = !pendingAttach;
   fPort.value = app && app.port != null ? app.port : '';
-  [fName, fCmd, fCwd, fPort].forEach(clearFieldError);
+  [fName, fCmd, fCwd, fPort, fProject].forEach(clearFieldError);
   setModalKind(presetKind || (app && app.kind) || 'service');
   appearanceDetails.open = !!(app && (app.icon || app.glyph));
   syncGlyphGrid();
@@ -308,6 +363,7 @@ function applyDetectedCandidate(candidate, option) {
   const previousAutoPort = detectedPortValue == null ? '' : String(detectedPortValue);
   const currentPort = fPort.value.trim();
   fCmd.value = candidate.command || '';
+  detectedAutoOpen = candidate.role === 'frontend';
   clearFieldError(fCmd);
   setModalKind(candidate.kind || 'service');
   if (candidate.port != null) {
@@ -481,11 +537,18 @@ async function saveApp() {
     port,
     glyph: selectedGlyph || null,
     kind: modalKind,
+    autoOpen: modalKind === 'service' && (detectedAutoOpen === true ||
+      (detectedAutoOpen == null && !!(editingAppOriginal && editingAppOriginal.autoOpen))),
+    projectKey: modalKind === 'task' ? null : (fProject.value || null),
   };
   const wasCreating = !editingAppId;
   const attachRequest = wasCreating && pendingAttach && modalKind === 'service'
     && port === pendingAttach.port ? { ...pendingAttach } : null;
-  if (attachRequest) body.attachPid = attachRequest.pid;
+  if (attachRequest) {
+    if (!body.cwd) return fieldError(fCwd, '请先选择该服务的项目文件夹');
+    if (!attachConfirm.checked) return toast('请确认工作目录属于正在运行的服务');
+    body.attachPid = attachRequest.pid;
+  }
   appSaving = true;
   refreshEditSaveMode();
   try {
@@ -561,14 +624,14 @@ export function initAppModal({ onAddService, onAddTask }) {
   btnPickScript.addEventListener('click', async () => {
     btnPickScript.disabled = true;
     try {
-      const r = await act(post('/api/pick', { what: 'script' }));
+      const r = await act(post('/api/pick', { what: 'script' }, PICKER_REQUEST_TIMEOUT_MS));
       if (!r || r.canceled || !r.path) return;  // 取消或失败均静默
       const p = r.path;
       fCmd.value = r.command || fallbackScriptCommand(p);
-      const dir = p.slice(0, p.lastIndexOf('/'));
+      const dir = p.slice(0, Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')));
       if (dir && !fCwd.value.trim()) fCwd.value = dir;
       if (!fName.value.trim()) {
-        const base = p.split('/').pop().replace(/\.(command|sh|bash|zsh|py)$/i, '');
+        const base = p.split(/[\\/]/).pop().replace(/\.(command|sh|bash|zsh|py|ps1|psm1|bat|cmd)$/i, '');
         if (base) fName.value = base;
       }
       fCmd.classList.remove('invalid');
@@ -583,11 +646,11 @@ export function initAppModal({ onAddService, onAddTask }) {
     }
   });
 
-  /* 浏览工作目录（macOS 原生选择框） */
+  /* 浏览工作目录（当前操作系统的原生选择框） */
   btnPickCwd.addEventListener('click', async () => {
     btnPickCwd.disabled = true;
     try {
-      const r = await act(post('/api/pick', { what: 'dir' }));
+      const r = await act(post('/api/pick', { what: 'dir' }, PICKER_REQUEST_TIMEOUT_MS));
       if (r && !r.canceled && r.path) {
         fCwd.value = r.path;
         fCwd.classList.remove('invalid');
@@ -599,8 +662,11 @@ export function initAppModal({ onAddService, onAddTask }) {
     }
   });
   btnDetectProject.addEventListener('click', detectProject);
-  fCwd.addEventListener('input', () => resetDetection(true));
-  [fName, fCmd, fCwd, fPort].forEach(input =>
+  fCwd.addEventListener('input', () => {
+    attachConfirm.checked = false;
+    resetDetection(true);
+  });
+  [fName, fCmd, fCwd, fPort, attachConfirm].forEach(input =>
     input.addEventListener('input', () => {
       clearFieldError(input);
       refreshEditSaveMode();
@@ -647,7 +713,7 @@ export function initAppModal({ onAddService, onAddTask }) {
   });
   fName.addEventListener('input', renderIconPreview);
   /* 非 textarea 字段回车直接保存 */
-  [fName, fCwd, fPort].forEach(inp =>
+  [fName, fCwd, fPort, fProject].forEach(inp =>
     inp.addEventListener('keydown', e => { if (e.key === 'Enter') saveApp(); }));
 }
 

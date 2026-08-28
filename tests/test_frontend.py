@@ -105,6 +105,13 @@ class FrontendStructureParser(HTMLParser):
 
 
 class FrontendAccessibilityContractTests(unittest.TestCase):
+    def test_windows_picker_fallback_handles_backslash_paths_and_scripts(self):
+        source = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+        self.assertIn("p.lastIndexOf('\\\\')", source)
+        self.assertIn("split(/[\\\\/]/)", source)
+        self.assertIn("suffix === '.ps1'", source)
+        self.assertIn("suffix === '.bat'", source)
+
     def test_monitoring_tables_have_named_aria_structure(self):
         parser = FrontendStructureParser()
         parser.feed((ROOT / "static/index.html").read_text(encoding="utf-8"))
@@ -223,6 +230,42 @@ class FrontendAccessibilityContractTests(unittest.TestCase):
         self.assertIn("配置与运行诊断", launchpad)
         self.assertIn("const isTask = modalKind === 'task'", overlays)
         self.assertIn("const stopVerb = isTask ? '中止任务' : '停止服务'", overlays)
+
+    def test_codex_synced_services_are_grouped_without_merging_ports(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="svcProjectGroups"', html)
+        self.assertIn("function groupCodexServices", launchpad)
+        self.assertIn("sync.projectKey || sync.key", launchpad)
+        self.assertIn("displayedPorts(app)", launchpad)
+        self.assertIn("reconcile(r.grid, group.apps", launchpad)
+        self.assertIn(".project-group", ops)
+
+    def test_service_form_can_assign_an_existing_project_group(self):
+        html = (ROOT / "static/index.html").read_text(encoding="utf-8")
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="fProject"', html)
+        self.assertIn("function populateProjectChoices", overlays)
+        self.assertIn("projectKey: modalKind === 'task' ? null", overlays)
+        self.assertIn("projectField.hidden = modalKind === 'task'", overlays)
+
+    def test_detected_frontend_candidate_is_saved_for_auto_open(self):
+        overlays = (ROOT / "static/js/overlays.js").read_text(encoding="utf-8")
+
+        self.assertIn("detectedAutoOpen = candidate.role === 'frontend'", overlays)
+        self.assertIn("autoOpen: modalKind === 'service'", overlays)
+
+    def test_dragging_service_to_another_project_updates_membership(self):
+        launchpad = (ROOT / "static/js/launchpad.js").read_text(encoding="utf-8")
+        ops = (ROOT / "static/themes/ops.css").read_text(encoding="utf-8")
+
+        self.assertIn("targetProject !== d.sourceProject", launchpad)
+        self.assertIn("setProjectDropTarget(d, targetProject)", launchpad)
+        self.assertIn("put('/api/apps/' + appId, { projectKey })", launchpad)
+        self.assertIn("project-drop-target", ops)
 
     def test_new_port_discovery_is_session_scoped_and_actionable(self):
         html = (ROOT / "static/index.html").read_text(encoding="utf-8")

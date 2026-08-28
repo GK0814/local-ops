@@ -3,7 +3,7 @@
    launchpad.js — 启动台：应用卡片 / 拖拽排序 / 端口诊断 / 启动诊断
    ============================================================ */
 import { $, el, setText, setChildren, setKpi, setKpiUnit, icon, iconBtn, escapeHtml,
-  post, del, act, toast, openLayer, closeLayer, reconcile,
+  post, put, del, act, toast, openLayer, closeLayer, reconcile,
   state, findApp, fmtUptime, fmtDuration, taskExitStatus,
   localServiceUrl } from './core.js';
 import { openConfirm, openAppModal, openLogs, getIconVer } from './overlays.js';
@@ -11,6 +11,7 @@ import { configuredPort, actualPorts, hasPortMismatch,
   preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
 
 const svcGrid = $('#svcGrid'), taskGrid = $('#taskGrid');
+const svcProjectGroups = $('#svcProjectGroups');
 const reorderStatus = $('#reorderStatus');
 /* ---------------- 图标取色光晕 ---------------- */
 function hueFromString(s) {
@@ -281,7 +282,9 @@ function updateAppCard(card, app) {
   r.dot.classList.toggle('running', !!app.running);
   r.dot.classList.toggle('success', taskSucceeded);
   r.dot.classList.toggle('danger', taskFailed);
-  let stTxt = app.running ? '运行中' : (app.port ? '已停止' : '未运行');
+  let stTxt = app.running
+    ? (app.recoveredExternal ? '已关联外部重启' : '运行中')
+    : (app.port ? '已停止' : '未运行');
   let stFail = false;
   let taskHistoryText = '';
   if (app.portConflict) {
@@ -437,7 +440,9 @@ async function toggleApp(id, button) {
       if (starting) {
         toast(isTask
           ? targetName + '已开始运行'
-          : '启动命令已执行，正在等待' + (app.port ? ' :' + app.port : '服务'));
+          : result.openWhenReady
+            ? '前端正在就绪，页面将在可访问后自动打开'
+            : '启动命令已执行，正在等待' + (app.port ? ' :' + app.port : '服务'));
         await window.__poll();
         setTimeout(window.__poll, 700);
         setTimeout(window.__poll, 1800);
@@ -716,7 +721,7 @@ appDiagLogs.addEventListener('click', () => {
 });
 
 /* ---------------- 卡片拖拽排序（pointer 实现：滑块式跟手 + 虚线占位） ---------------- */
-let drag = null;  // { card, ph, grid, dx, dy, originIndex }
+let drag = null;  // { card, ph, grid, sourceProject, projectTarget, dx, dy, originIndex }
 let keyboardSort = null;  // { card, grid, originalIds }
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -821,6 +826,8 @@ function beginDrag(card, e) {
   document.body.classList.add('dragging-on');
   drag = {
     card, ph, grid, originIndex,
+    sourceProject: grid.closest('.project-group'),
+    projectTarget: null,
     dx: e.clientX - rect.left,
     dy: e.clientY - rect.top,
   };
@@ -832,6 +839,12 @@ function moveDrag(e) {
   d.card.style.transform =
     'translate(' + (e.clientX - d.dx) + 'px,' + (e.clientY - d.dy) + 'px)';
   const hit = document.elementFromPoint(e.clientX, e.clientY);
+  const targetProject = hit && hit.closest('.project-group');
+  if (targetProject && targetProject !== d.sourceProject && targetProject.dataset.key) {
+    setProjectDropTarget(d, targetProject);
+    return;
+  }
+  setProjectDropTarget(d, null);
   const over = hit && hit.closest('.app-card');
   if (over && d.grid.contains(over) && !over.classList.contains('add-card')) {
     /* 用布局坐标（offsetLeft，不含 FLIP transform）判定插入侧，
@@ -852,11 +865,19 @@ function moveDrag(e) {
   }
 }
 
+function setProjectDropTarget(dragState, target) {
+  if (dragState.projectTarget === target) return;
+  if (dragState.projectTarget) dragState.projectTarget.classList.remove('project-drop-target');
+  dragState.projectTarget = target || null;
+  if (dragState.projectTarget) dragState.projectTarget.classList.add('project-drop-target');
+}
+
 function resetPointerDragCard(d) {
   const s = d.card.style;
   s.position = s.left = s.top = s.width = s.height = s.margin =
     s.zIndex = s.transform = s.transition = s.pointerEvents = '';
   d.card.classList.remove('lifted');
+  setProjectDropTarget(d, null);
   document.body.classList.remove('dragging-on');
 }
 
@@ -888,6 +909,23 @@ function dragDropOrder(d) {
 function endDrag() {
   const d = drag;
   drag = null;
+  const targetProject = d.projectTarget;
+  if (targetProject) {
+    const projectKey = targetProject.dataset.key;
+    const projectName = targetProject.querySelector('.project-group-title')?.textContent?.trim()
+      || '目标项目';
+    const appId = d.card.dataset.key;
+    d.grid.insertBefore(d.card, d.ph);
+    d.ph.remove();
+    resetPointerDragCard(d);
+    act(put('/api/apps/' + appId, { projectKey })).then(result => {
+      if (result && result.ok !== false) {
+        toast('已将“' + (findApp(appId)?.name || '服务') + '”移入“' + projectName + '”');
+        window.__poll();
+      }
+    });
+    return;
+  }
   const orderSnapshot = dragDropOrder(d);
   const finish = () => {
     d.grid.insertBefore(d.card, d.ph);
@@ -984,12 +1022,17 @@ export function renderLaunchpad(apps, firstRender) {
   if (drag || keyboardSort) return;  // 排序中轮询不打乱 DOM
   const svcs = apps.filter(a => (a.kind || 'service') !== 'task');
   const tasks = apps.filter(a => a.kind === 'task');
+  const projectGroups = groupCodexServices(svcs);
+  const groupedIds = new Set(projectGroups.flatMap(group =>
+    group.apps.map(app => app.id)));
+  const standaloneSvcs = svcs.filter(app => !groupedIds.has(app.id));
   const addSvc = $('#addSvcCard');
   const addTask = $('#addTaskCard');
   addSvc.remove();
   addTask.remove();
-  reconcile(svcGrid, svcs, a => a.id, createAppCard, updateAppCard, firstRender);
+  reconcile(svcGrid, standaloneSvcs, a => a.id, createAppCard, updateAppCard, firstRender);
   svcGrid.prepend(addSvc);                  // 新增入口始终优先可见
+  reconcileProjectGroups(projectGroups, firstRender);
   reconcile(taskGrid, tasks, a => a.id, createAppCard, updateAppCard, firstRender);
   taskGrid.prepend(addTask);                // 批处理新增入口始终优先可见
   renderLpKpi(apps, svcs, tasks);
@@ -1005,11 +1048,96 @@ function syncSvcFilterUI() {
   renderFilterChips($('#svcFilter'), SVC_FILTERS, latestSvcs, svcFilter, matchSvcFilter,
     f => { svcFilter = f; syncSvcFilterUI(); });
   applyGridFilter(svcGrid, latestSvcs, matchSvcFilter, svcFilter);
+  applyGridFilter(svcProjectGroups, latestSvcs, matchSvcFilter, svcFilter);
 }
 function syncTaskFilterUI() {
   renderFilterChips($('#taskFilter'), TASK_FILTERS, latestTasks, taskFilter, matchTaskFilter,
     f => { taskFilter = f; syncTaskFilterUI(); });
   applyGridFilter(taskGrid, latestTasks, matchTaskFilter, taskFilter);
+}
+
+/* ---------------- Codex 同步项目组 ---------------- */
+const ROLE_LABELS = {
+  frontend: '前端', backend: '后端', stack: '编排', service: '服务',
+};
+
+function codexProjectKey(app) {
+  if (app && app.project && app.project.key) return app.project.key;
+  const sync = app && app.sync;
+  if (!sync || sync.origin !== 'codex') return '';
+  return sync.projectKey || sync.key || '';
+}
+
+function projectInfo(app) {
+  if (app && app.project && app.project.key) return app.project;
+  const sync = app && app.sync;
+  return sync ? {
+    key: sync.projectKey || sync.key || '',
+    name: sync.projectName || app.name || '未命名项目',
+    cwd: sync.projectPath || app.cwd || '',
+  } : null;
+}
+
+function groupCodexServices(services) {
+  const groups = new Map();
+  for (const app of services) {
+    const key = codexProjectKey(app);
+    if (!key) continue;
+    if (!groups.has(key)) {
+      const project = projectInfo(app) || {};
+      groups.set(key, {
+        key,
+        name: project.name || app.name || '未命名项目',
+        cwd: project.cwd || app.cwd || '',
+        apps: [],
+      });
+    }
+    groups.get(key).apps.push(app);
+  }
+  return [...groups.values()];
+}
+
+function projectPorts(group) {
+  return [...new Set(group.apps.flatMap(app => displayedPorts(app)))].sort((a, b) => a - b);
+}
+
+function projectRoles(group) {
+  return [...new Set(group.apps.map(app =>
+    ROLE_LABELS[(app.sync || {}).role] || '服务'))];
+}
+
+function createProjectGroup() {
+  const section = el('section', 'project-group');
+  const head = el('div', 'project-group-head');
+  const title = el('div', 'project-group-title');
+  title.append(icon('folder-git-2', 17), el('span'));
+  const summary = el('div', 'project-group-summary');
+  head.append(title, summary);
+  const grid = el('div', 'app-grid project-service-grid');
+  section.append(head, grid);
+  section._r = { title, summary, grid };
+  return section;
+}
+
+function updateProjectGroup(section, group) {
+  const r = section._r;
+  const titleText = r.title.lastElementChild;
+  setText(titleText, group.name);
+  r.title.title = group.cwd || group.name;
+  const ports = projectPorts(group);
+  const running = group.apps.filter(app => app.running).length;
+  const parts = [projectRoles(group).join(' · '),
+    running + '/' + group.apps.length + ' 运行'];
+  if (ports.length) parts.push(ports.map(port => ':' + port).join(' '));
+  setText(r.summary, parts.join('  ·  '));
+  reconcile(r.grid, group.apps, app => app.id,
+    createAppCard, updateAppCard, false);
+}
+
+function reconcileProjectGroups(groups, firstRender) {
+  if (!svcProjectGroups) return;
+  reconcile(svcProjectGroups, groups, group => group.key,
+    createProjectGroup, updateProjectGroup, firstRender);
 }
 
 /* ---------------- 启动台 KPI ---------------- */
@@ -1108,5 +1236,9 @@ function applyGridFilter(grid, apps, match, filter) {
   for (const card of grid.querySelectorAll('.app-card[data-key]')) {
     const app = byId.get(card.dataset.key);
     card.hidden = app ? !match(app, filter) : false;
+  }
+  for (const group of grid.querySelectorAll('.project-group')) {
+    group.hidden = ![...group.querySelectorAll('.app-card[data-key]')]
+      .some(card => !card.hidden);
   }
 }
